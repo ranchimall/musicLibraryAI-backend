@@ -72,6 +72,16 @@ async function fetchSunoPlayCount(inputUrl) {
   }
 }
 
+// Health Check Endpoint
+app.get("/health", (req, res) => {
+  res.json({
+    success: true,
+    status: "ok",
+    uptime: process.uptime(),
+    timestamp: new Date().toISOString(),
+  });
+});
+
 // 1. GET /api/suno-plays
 app.get("/api/suno-plays", async (req, res) => {
   const targetUrl = req.query.url;
