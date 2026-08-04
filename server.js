@@ -39,8 +39,10 @@ const db = new sqlite3.Database(dbPath, (err) => {
             play_count INTEGER DEFAULT 0
         )`);
     db.run(`CREATE TABLE IF NOT EXISTS likes (
-    track_id TEXT PRIMARY KEY,
-    like_count INTEGER DEFAULT 0
+    track_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    liked_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY(track_id, user_id)
 )`);
   }
 });
@@ -163,30 +165,44 @@ app.get("/api/platform-plays", (req, res) => {
 // 3. GET /api/likes
 app.get("/api/likes", (req, res) => {
   const trackId = req.query.id;
+  const userId = req.query.user;
 
-  if (!trackId || !trackId.trim()) {
+  if (!trackId || !trackId.trim() || !userId || !userId.trim()) {
     return res.status(400).json({
       success: false,
-      error: "Missing track id",
+      error: "Missing track id or user id",
     });
   }
 
   db.get(
-    "SELECT like_count FROM likes WHERE track_id = ?",
+    "SELECT COUNT(*) AS likeCount FROM likes WHERE track_id = ?",
     [trackId],
-    (err, row) => {
+    (err, countRow) => {
       if (err) {
-        console.error(err);
         return res.status(500).json({
           success: false,
           error: "Database error",
         });
       }
 
-      res.json({
-        success: true,
-        likeCount: row ? row.like_count : 0,
-      });
+      db.get(
+        "SELECT 1 FROM likes WHERE track_id = ? AND user_id = ?",
+        [trackId, userId],
+        (err, likeRow) => {
+          if (err) {
+            return res.status(500).json({
+              success: false,
+              error: "Database error",
+            });
+          }
+
+          res.json({
+            success: true,
+            likeCount: countRow.likeCount,
+            liked: !!likeRow,
+          });
+        },
+      );
     },
   );
 });
@@ -244,57 +260,84 @@ app.post("/api/platform-plays", (req, res) => {
 });
 
 // 5. POST /api/likes
-   app.post("/api/likes", (req, res) => {
-    const trackId = req.query.id;
 
-    if (!trackId || !trackId.trim()) {
-      return res.status(400).json({
-        success: false,
-        error: "Missing track id",
-      });
-    }
+app.post("/api/likes", (req, res) => {
+  const trackId = req.query.id;
+  const userId = req.query.user;
 
-    const stmt = db.prepare(`
-    INSERT INTO likes (track_id, like_count)
-    VALUES (?, 1)
-    ON CONFLICT(track_id)
-    DO UPDATE SET like_count = like_count + 1
-  `);
+  if (!trackId || !trackId.trim() || !userId || !userId.trim()) {
+    return res.status(400).json({
+      success: false,
+      error: "Missing track id or user id",
+    });
+  }
 
-    stmt.run([trackId], function (err) {
+  db.get(
+    "SELECT 1 FROM likes WHERE track_id = ? AND user_id = ?",
+    [trackId, userId],
+    (err, row) => {
       if (err) {
-        stmt.finalize();
-
-        console.error(err);
         return res.status(500).json({
           success: false,
           error: "Database error",
         });
       }
 
-      db.get(
-        "SELECT like_count FROM likes WHERE track_id = ?",
-        [trackId],
-        (err, row) => {
-          stmt.finalize();
+      const finish = (likedState) => {
+        db.get(
+          "SELECT COUNT(*) AS likeCount FROM likes WHERE track_id = ?",
+          [trackId],
+          (err, countRow) => {
+            if (err) {
+              return res.status(500).json({
+                success: false,
+                error: "Database error",
+              });
+            }
 
-          if (err) {
-            console.error(err);
-            return res.status(500).json({
-              success: false,
-              error: "Database error",
+            res.json({
+              success: true,
+              liked: likedState,
+              likeCount: countRow.likeCount,
             });
-          }
+          },
+        );
+      };
 
-          res.json({
-            success: true,
-            likeCount: row.like_count,
-          });
-        },
-      );
-    });
-  });
+      if (row) {
+        db.run(
+          "DELETE FROM likes WHERE track_id = ? AND user_id = ?",
+          [trackId, userId],
+          (err) => {
+            if (err) {
+              return res.status(500).json({
+                success: false,
+                error: "Database error",
+              });
+            }
 
+            finish(false);
+          },
+        );
+      } else {
+        db.run(
+          "INSERT INTO likes (track_id, user_id) VALUES (?, ?)",
+          [trackId, userId],
+          (err) => {
+            if (err) {
+              return res.status(500).json({
+                success: false,
+                error: "Database error",
+              });
+            }
+
+            finish(true);
+          },
+        );
+      }
+    },
+  );
+});
 
 // Start the server
 console.log("Starting MusicMarketplace Oracle...");
