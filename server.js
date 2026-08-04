@@ -38,6 +38,10 @@ const db = new sqlite3.Database(dbPath, (err) => {
             track_id TEXT PRIMARY KEY,
             play_count INTEGER DEFAULT 0
         )`);
+    db.run(`CREATE TABLE IF NOT EXISTS likes (
+    track_id TEXT PRIMARY KEY,
+    like_count INTEGER DEFAULT 0
+)`);
   }
 });
 
@@ -156,7 +160,38 @@ app.get("/api/platform-plays", (req, res) => {
   );
 });
 
-// 3. POST /api/platform-plays
+// 3. GET /api/likes
+app.get("/api/likes", (req, res) => {
+  const trackId = req.query.id;
+
+  if (!trackId || !trackId.trim()) {
+    return res.status(400).json({
+      success: false,
+      error: "Missing track id",
+    });
+  }
+
+  db.get(
+    "SELECT like_count FROM likes WHERE track_id = ?",
+    [trackId],
+    (err, row) => {
+      if (err) {
+        console.error(err);
+        return res.status(500).json({
+          success: false,
+          error: "Database error",
+        });
+      }
+
+      res.json({
+        success: true,
+        likeCount: row ? row.like_count : 0,
+      });
+    },
+  );
+});
+
+// 4. POST /api/platform-plays
 app.post("/api/platform-plays", (req, res) => {
   const trackId = req.query.id;
 
@@ -207,6 +242,59 @@ app.post("/api/platform-plays", (req, res) => {
     );
   });
 });
+
+// 5. POST /api/likes
+   app.post("/api/likes", (req, res) => {
+    const trackId = req.query.id;
+
+    if (!trackId || !trackId.trim()) {
+      return res.status(400).json({
+        success: false,
+        error: "Missing track id",
+      });
+    }
+
+    const stmt = db.prepare(`
+    INSERT INTO likes (track_id, like_count)
+    VALUES (?, 1)
+    ON CONFLICT(track_id)
+    DO UPDATE SET like_count = like_count + 1
+  `);
+
+    stmt.run([trackId], function (err) {
+      if (err) {
+        stmt.finalize();
+
+        console.error(err);
+        return res.status(500).json({
+          success: false,
+          error: "Database error",
+        });
+      }
+
+      db.get(
+        "SELECT like_count FROM likes WHERE track_id = ?",
+        [trackId],
+        (err, row) => {
+          stmt.finalize();
+
+          if (err) {
+            console.error(err);
+            return res.status(500).json({
+              success: false,
+              error: "Database error",
+            });
+          }
+
+          res.json({
+            success: true,
+            likeCount: row.like_count,
+          });
+        },
+      );
+    });
+  });
+
 
 // Start the server
 console.log("Starting MusicMarketplace Oracle...");
