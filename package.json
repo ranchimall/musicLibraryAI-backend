@@ -1,7 +1,7 @@
 {
-  "name": "music-marketplace-backend",
+  "name": "music-library-backend",
   "version": "1.0.0",
-  "description": "Backend Oracle for MusicMarketplace",
+  "description": "Backend Oracle for MusicLibrary",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -12,7 +12,8 @@
   },
   "dependencies": {
     "cors": "^2.8.5",
+    "dotenv": "^17.4.2",
     "express": "^4.18.2",
-    "sqlite3": "^5.1.7"
+    "pg": "^8.22.0"
   }
 }

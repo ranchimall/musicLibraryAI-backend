@@ -1,8 +1,7 @@
 const express = require("express");
 const cors = require("cors");
-const sqlite3 = require("sqlite3").verbose();
-const path = require("path");
-const fs = require("fs");
+const { Pool } = require("pg");
+require("dotenv").config();
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -23,29 +22,22 @@ const cacheCleanupInterval = setInterval(() => {
 app.use(cors());
 app.use(express.json());
 
-// Initialize SQLite database for Native Platform Plays
-const dataDir = path.join(__dirname, "data");
-if (!fs.existsSync(dataDir)) {
-  fs.mkdirSync(dataDir);
-}
-const dbPath = path.join(dataDir, "plays.db");
-const db = new sqlite3.Database(dbPath, (err) => {
-  if (err) {
-    console.error("Error opening database", err);
-  } else {
-    console.log("Connected to SQLite database at", dbPath);
-    db.run(`CREATE TABLE IF NOT EXISTS plays (
-            track_id TEXT PRIMARY KEY,
-            play_count INTEGER DEFAULT 0
-        )`);
-    db.run(`CREATE TABLE IF NOT EXISTS likes (
-    track_id TEXT NOT NULL,
-    user_id TEXT NOT NULL,
-    liked_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY(track_id, user_id)
-)`);
-  }
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: {
+    rejectUnauthorized: false,
+  },
 });
+
+pool
+  .connect()
+  .then((client) => {
+    console.log("Connected to Neon PostgreSQL");
+    client.release();
+  })
+  .catch((err) => {
+    console.error("Database connection failed:", err);
+  });
 
 // Helper: Scrape Suno Plays
 async function fetchSunoPlayCount(inputUrl) {
@@ -133,7 +125,7 @@ app.get("/api/suno-plays", async (req, res) => {
 });
 
 // 2. GET /api/platform-plays
-app.get("/api/platform-plays", (req, res) => {
+app.get("/api/platform-plays", async (req, res) => {
   const trackId = req.query.id;
 
   if (!trackId || !trackId.trim()) {
@@ -143,72 +135,65 @@ app.get("/api/platform-plays", (req, res) => {
     });
   }
 
-  db.get(
-    "SELECT play_count FROM plays WHERE track_id = ?",
-    [trackId],
-    (err, row) => {
-      if (err) {
-        console.error(err);
-        return res.status(500).json({
-          success: false,
-          error: "Database error",
-        });
-      }
-      res.json({
-        success: true,
-        playCount: row ? row.play_count : 0,
-      });
-    },
-  );
+  try {
+    const result = await pool.query(
+      "SELECT play_count FROM plays WHERE track_id = $1",
+      [trackId],
+    );
+
+    res.json({
+      success: true,
+      playCount: result.rows.length ? result.rows[0].play_count : 0,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({
+      success: false,
+      error: "Database error",
+    });
+  }
 });
 
 // 3. GET /api/likes
-app.get("/api/likes", (req, res) => {
+app.get("/api/likes", async (req, res) => {
   const trackId = req.query.id;
   const userId = req.query.user;
 
-  if (!trackId || !trackId.trim() || !userId || !userId.trim()) {
+  if (!trackId || !userId) {
     return res.status(400).json({
       success: false,
       error: "Missing track id or user id",
     });
   }
 
-  db.get(
-    "SELECT COUNT(*) AS likeCount FROM likes WHERE track_id = ?",
-    [trackId],
-    (err, countRow) => {
-      if (err) {
-        return res.status(500).json({
-          success: false,
-          error: "Database error",
-        });
-      }
+  try {
+    const countResult = await pool.query(
+      "SELECT COUNT(*)::int AS like_count FROM likes WHERE track_id = $1",
+      [trackId],
+    );
 
-      db.get(
-        "SELECT 1 FROM likes WHERE track_id = ? AND user_id = ?",
-        [trackId, userId],
-        (err, likeRow) => {
-          if (err) {
-            return res.status(500).json({
-              success: false,
-              error: "Database error",
-            });
-          }
+    const likedResult = await pool.query(
+      "SELECT 1 FROM likes WHERE track_id = $1 AND user_id = $2",
+      [trackId, userId],
+    );
 
-          res.json({
-            success: true,
-            likeCount: countRow.likeCount,
-            liked: !!likeRow,
-          });
-        },
-      );
-    },
-  );
+    res.json({
+      success: true,
+      likeCount: countResult.rows[0].like_count,
+      liked: likedResult.rows.length > 0,
+    });
+  } catch (err) {
+    console.error(err);
+
+    res.status(500).json({
+      success: false,
+      error: "Database error",
+    });
+  }
 });
 
 // 4. POST /api/platform-plays
-app.post("/api/platform-plays", (req, res) => {
+app.post("/api/platform-plays", async (req, res) => {
   const trackId = req.query.id;
 
   if (!trackId || !trackId.trim()) {
@@ -218,125 +203,83 @@ app.post("/api/platform-plays", (req, res) => {
     });
   }
 
-  // Upsert logic: insert if not exists, else increment
-  const stmt = db.prepare(`
-        INSERT INTO plays (track_id, play_count) 
-        VALUES (?, 1)
-        ON CONFLICT(track_id) DO UPDATE SET play_count = play_count + 1
-    `);
-
-  stmt.run([trackId], function (err) {
-    if (err) {
-      stmt.finalize();
-
-      console.error(err);
-      return res.status(500).json({
-        success: false,
-        error: "Database error",
-      });
-    }
-
-    db.get(
-      "SELECT play_count FROM plays WHERE track_id = ?",
+  try {
+    const result = await pool.query(
+      `
+      INSERT INTO plays (track_id, play_count)
+      VALUES ($1, 1)
+      ON CONFLICT (track_id)
+      DO UPDATE SET play_count = plays.play_count + 1
+      RETURNING play_count
+      `,
       [trackId],
-      (err, row) => {
-        stmt.finalize();
-
-        if (err) {
-          console.error(err);
-          return res.status(500).json({
-            success: false,
-            error: "Database error",
-          });
-        }
-
-        res.json({
-          success: true,
-          playCount: row.play_count,
-        });
-      },
     );
-  });
+
+    res.json({
+      success: true,
+      playCount: result.rows[0].play_count,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({
+      success: false,
+      error: "Database error",
+    });
+  }
 });
 
 // 5. POST /api/likes
-
-app.post("/api/likes", (req, res) => {
+app.post("/api/likes", async (req, res) => {
   const trackId = req.query.id;
   const userId = req.query.user;
 
-  if (!trackId || !trackId.trim() || !userId || !userId.trim()) {
+  if (!trackId || !userId) {
     return res.status(400).json({
       success: false,
       error: "Missing track id or user id",
     });
   }
 
-  db.get(
-    "SELECT 1 FROM likes WHERE track_id = ? AND user_id = ?",
-    [trackId, userId],
-    (err, row) => {
-      if (err) {
-        return res.status(500).json({
-          success: false,
-          error: "Database error",
-        });
-      }
+  try {
+    const existing = await pool.query(
+      "SELECT 1 FROM likes WHERE track_id = $1 AND user_id = $2",
+      [trackId, userId],
+    );
 
-      const finish = (likedState) => {
-        db.get(
-          "SELECT COUNT(*) AS likeCount FROM likes WHERE track_id = ?",
-          [trackId],
-          (err, countRow) => {
-            if (err) {
-              return res.status(500).json({
-                success: false,
-                error: "Database error",
-              });
-            }
+    let liked;
 
-            res.json({
-              success: true,
-              liked: likedState,
-              likeCount: countRow.likeCount,
-            });
-          },
-        );
-      };
+    if (existing.rows.length) {
+      await pool.query(
+        "DELETE FROM likes WHERE track_id = $1 AND user_id = $2",
+        [trackId, userId],
+      );
+      liked = false;
+    } else {
+      await pool.query(
+        "INSERT INTO likes (track_id, user_id) VALUES ($1, $2)",
+        [trackId, userId],
+      );
+      liked = true;
+    }
 
-      if (row) {
-        db.run(
-          "DELETE FROM likes WHERE track_id = ? AND user_id = ?",
-          [trackId, userId],
-          (err) => {
-            if (err) {
-              return res.status(500).json({
-                success: false,
-                error: "Database error",
-              });
-            }
+    const countResult = await pool.query(
+      "SELECT COUNT(*)::int AS like_count FROM likes WHERE track_id = $1",
+      [trackId],
+    );
 
-            finish(false);
-          },
-        );
-      } else {
-        db.run(
-          "INSERT INTO likes (track_id, user_id) VALUES (?, ?)",
-          [trackId, userId],
-          (err) => {
-            if (err) {
-              return res.status(500).json({
-                success: false,
-                error: "Database error",
-              });
-            }
+    res.json({
+      success: true,
+      liked,
+      likeCount: countResult.rows[0].like_count,
+    });
+  } catch (err) {
+    console.error(err);
 
-            finish(true);
-          },
-        );
-      }
-    },
-  );
+    res.status(500).json({
+      success: false,
+      error: "Database error",
+    });
+  }
 });
 
 // Start the server
@@ -346,15 +289,16 @@ app.listen(port, () => {
   console.log(`MusicMarketplace Oracle listening on port ${port}`);
 });
 
-function shutdown() {
-  console.log("Closing database...");
+async function shutdown() {
+  console.log("Closing PostgreSQL pool...");
 
   clearInterval(cacheCleanupInterval);
 
-  db.close(() => {
-    console.log("Database closed.");
-    process.exit(0);
-  });
+  await pool.end();
+
+  console.log("PostgreSQL pool closed.");
+
+  process.exit(0);
 }
 
 process.on("SIGINT", shutdown);
