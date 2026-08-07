@@ -192,7 +192,37 @@ app.get("/api/likes", async (req, res) => {
   }
 });
 
-// 4. POST /api/platform-plays
+// 4. GET /api/liked-tracks 
+app.get("/api/liked-tracks", async (req, res) => {
+  const userId = req.query.user;
+
+  if (!userId || !userId.trim()) {
+    return res.status(400).json({
+      success: false,
+      error: "Missing user id",
+    });
+  }
+
+  try {
+    const result = await pool.query(
+      "SELECT track_id FROM likes WHERE user_id = $1 ORDER BY track_id",
+      [userId],
+    );
+
+    res.json({
+      success: true,
+      trackIds: result.rows.map((row) => row.track_id),
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({
+      success: false,
+      error: "Database error",
+    });
+  }
+});
+
+// 5. POST /api/platform-plays
 app.post("/api/platform-plays", async (req, res) => {
   const trackId = req.query.id;
 
@@ -228,7 +258,7 @@ app.post("/api/platform-plays", async (req, res) => {
   }
 });
 
-// 5. POST /api/likes
+// 6. POST /api/likes
 app.post("/api/likes", async (req, res) => {
   const trackId = req.query.id;
   const userId = req.query.user;
