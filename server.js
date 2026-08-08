@@ -312,6 +312,56 @@ app.post("/api/likes", async (req, res) => {
   }
 });
 
+// 7. GET /api/user-stats
+// Aggregates total plays and total likes across a set of track ids in one
+app.get("/api/user-stats", async (req, res) => {
+  const idsParam = req.query.ids;
+
+  if (!idsParam || !idsParam.trim()) {
+    return res.status(400).json({
+      success: false,
+      error: "Missing ids parameter",
+    });
+  }
+
+  const trackIds = idsParam
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  if (!trackIds.length) {
+    return res.json({
+      success: true,
+      totalPlays: 0,
+      totalLikes: 0,
+    });
+  }
+
+  try {
+    const playsResult = await pool.query(
+      "SELECT COALESCE(SUM(play_count), 0)::int AS total FROM plays WHERE track_id = ANY($1)",
+      [trackIds],
+    );
+
+    const likesResult = await pool.query(
+      "SELECT COUNT(*)::int AS total FROM likes WHERE track_id = ANY($1)",
+      [trackIds],
+    );
+
+    res.json({
+      success: true,
+      totalPlays: playsResult.rows[0].total,
+      totalLikes: likesResult.rows[0].total,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({
+      success: false,
+      error: "Database error",
+    });
+  }
+});
+
 // Start the server
 console.log("Starting MusicMarketplace Oracle...");
 
