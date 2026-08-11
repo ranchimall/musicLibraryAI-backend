@@ -6,14 +6,21 @@ require("dotenv").config();
 const app = express();
 const port = process.env.PORT || 3000;
 const sunoCache = new Map();
+const flowCache = new Map();
 const CACHE_DURATION = 5 * 60 * 1000; // 5 minutes
 
 const cacheCleanupInterval = setInterval(() => {
   const now = Date.now();
 
-  for (const [url, entry] of sunoCache.entries()) {
+  for (const [key, entry] of sunoCache.entries()) {
     if (now - entry.timestamp > CACHE_DURATION) {
-      sunoCache.delete(url);
+      sunoCache.delete(key);
+    }
+  }
+
+  for (const [key, entry] of flowCache.entries()) {
+    if (now - entry.timestamp > CACHE_DURATION) {
+      flowCache.delete(key);
     }
   }
 }, 60 * 1000);
@@ -69,6 +76,57 @@ async function fetchSunoPlayCount(inputUrl) {
     return null;
   }
 }
+
+// Helper: Scrape Google Flow Play Count
+async function fetchGoogleFlowPlayCount(inputUrl) {
+  try {
+    const response = await fetch(inputUrl, {
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        Accept:
+          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      },
+    });
+
+    if (!response.ok) {
+      throw new Error(
+        `Failed to fetch Google Flow page. Status: ${response.status}`,
+      );
+    }
+
+    const html = await response.text();
+
+    // Flow embeds the song data inside the page's
+    // Next.js serialized data.
+    //
+    // Try the common play_count formats used by Flow.
+    const playCountMatch =
+      html.match(/"play_count"\s*:\s*(\d+)/i) ||
+      html.match(/"playCount"\s*:\s*(\d+)/i);
+
+    if (!playCountMatch) {
+      console.warn(
+        "Could not find play_count in Google Flow HTML",
+      );
+
+      return null;
+    }
+
+    const playCount = parseInt(playCountMatch[1], 10);
+
+    console.log(
+      `Google Flow play count: ${playCount}`,
+    );
+
+    return playCount;
+  } catch (error) {
+    console.error("Google Flow play count error:", error);
+
+    return null;
+  }
+}
+
 
 // Health Check Endpoint
 app.get("/health", (req, res) => {
@@ -361,6 +419,69 @@ app.get("/api/user-stats", async (req, res) => {
     });
   }
 });
+
+// 8. GET /api/google-flow-plays
+app.get("/api/google-flow-plays", async (req, res) => {
+  const targetUrl = req.query.url;
+
+  if (!targetUrl) {
+    return res.status(400).json({
+      success: false,
+      error: "Missing url parameter",
+    });
+  }
+
+  // Make sure this is actually a Google Flow URL
+  if (!targetUrl.includes("flowmusic.app")) {
+    return res.status(400).json({
+      success: false,
+      error: "Invalid Google Flow URL",
+    });
+  }
+
+  const cached = flowCache.get(targetUrl);
+
+  if (
+    cached &&
+    Date.now() - cached.timestamp < CACHE_DURATION
+  ) {
+    console.log(
+      `Serving cached Google Flow plays for ${targetUrl}`,
+    );
+
+    return res.json({
+      success: true,
+      playCount: cached.playCount,
+      cached: true,
+    });
+  }
+
+  console.log(
+    `Fetching Google Flow plays: ${targetUrl}`,
+  );
+
+  const playCount =
+    await fetchGoogleFlowPlayCount(targetUrl);
+
+  if (playCount !== null) {
+    flowCache.set(targetUrl, {
+      playCount,
+      timestamp: Date.now(),
+    });
+
+    return res.json({
+      success: true,
+      playCount,
+      cached: false,
+    });
+  }
+
+  return res.status(500).json({
+    success: false,
+    error: "Failed to extract Google Flow play count",
+  });
+});
+
 
 // Start the server
 console.log("Starting MusicMarketplace Oracle...");
