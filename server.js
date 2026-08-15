@@ -1795,6 +1795,20 @@ app.post(
   },
 );
 
+// POST /api/admin/whoami  { floId, time, pubKey, sign }
+// Signed: hashcontent = [floId, time].join("|")
+// Lets the frontend know whether the verified caller is an admin, so it
+// can hide admin-only controls (post task, add category, etc.) entirely
+// instead of showing them to everyone and 403ing on submit.
+app.post(
+  "/api/admin/whoami",
+  verifyFloSignature(["floId", "time"]),
+  (req, res) => {
+    const { floId } = req.body;
+    res.json({ success: true, isAdmin: ADMIN_FLO_IDS.includes(floId) });
+  },
+);
+
 // Manual trigger for the pipeline job - useful for testing without
 // waiting for the daily interval. Admin-only.
 // { adminFloId, time, pubKey, sign }
