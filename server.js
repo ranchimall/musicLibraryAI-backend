@@ -578,6 +578,21 @@ const BASE_PROPERTY_PRICE = 1;
 // Schema setup - runs on boot, idempotent (safe to re-run on every deploy)
 // ---------------------------------------------------------------------
 async function ensureMarketplaceSchema() {
+  // plays/likes belong to the original track-library feature 
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS plays (
+      track_id    TEXT PRIMARY KEY,
+      play_count  INT DEFAULT 0
+    );
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS likes (
+      track_id    TEXT NOT NULL,
+      user_id     TEXT NOT NULL,
+      PRIMARY KEY (track_id, user_id)
+    );
+  `);
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS categories (
       id            SERIAL PRIMARY KEY,
@@ -752,6 +767,32 @@ function rateLimit({ windowMs = 60 * 1000, max = 20 } = {}) {
 
     recent.push(now);
     rateLimitBuckets.set(key, recent);
+    next();
+  };
+}
+
+// Admin allowlist for marketplace admin actions (creating categories,
+// logging usage events, manually triggering the pipeline). Configurable
+// via ADMIN_FLO_IDS (comma-separated) with a hardcoded default so this
+// works out of the box 
+const ADMIN_FLO_IDS = (
+  process.env.ADMIN_FLO_IDS || "FSLjdS5mtMzfZ3BRHMyqueshFSRxNkuJeN"
+)
+  .split(",")
+  .map((id) => id.trim())
+  .filter(Boolean);
+
+// Must run after verifyFloSignature - it trusts req.body[floIdField]
+// because the signature middleware already proved that ID signed this
+// request. Doesn't do its own signature check.
+function requireAdmin(floIdField = "floId") {
+  return (req, res, next) => {
+    const floId = req.body[floIdField];
+    if (!floId || !ADMIN_FLO_IDS.includes(floId)) {
+      return res
+        .status(403)
+        .json({ success: false, error: "Admin access required" });
+    }
     next();
   };
 }
@@ -1005,29 +1046,36 @@ app.get("/api/categories", async (req, res) => {
   }
 });
 
-// POST /api/categories - create/upsert a category
-app.post("/api/categories", async (req, res) => {
-  const { slug, name } = req.body;
+// POST /api/categories - create/upsert a category. Admin-only
+app.post(
+  "/api/categories",
+  verifyFloSignature(["adminFloId", "slug", "name", "time"], {
+    floIdField: "adminFloId",
+  }),
+  requireAdmin("adminFloId"),
+  async (req, res) => {
+    const { slug, name } = req.body;
 
-  if (!slug || !name) {
-    return res
-      .status(400)
-      .json({ success: false, error: "Missing slug or name" });
-  }
+    if (!slug || !name) {
+      return res
+        .status(400)
+        .json({ success: false, error: "Missing slug or name" });
+    }
 
-  try {
-    const result = await pool.query(
-      `INSERT INTO categories (slug, name) VALUES ($1, $2)
+    try {
+      const result = await pool.query(
+        `INSERT INTO categories (slug, name) VALUES ($1, $2)
        ON CONFLICT (slug) DO UPDATE SET name = EXCLUDED.name
        RETURNING *`,
-      [slug, name],
-    );
-    res.json({ success: true, category: result.rows[0] });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ success: false, error: "Database error" });
-  }
-});
+        [slug, name],
+      );
+      res.json({ success: true, category: result.rows[0] });
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ success: false, error: "Database error" });
+    }
+  },
+);
 
 // GET /api/categories/:slug/leaderboard?component=music
 app.get("/api/categories/:slug/leaderboard", async (req, res) => {
@@ -1082,56 +1130,66 @@ app.get("/api/categories/:slug/leaderboard", async (req, res) => {
 // ---------------------------------------------------------------------
 
 // POST /api/tracks/:trackId/components
-app.post("/api/tracks/:trackId/components", async (req, res) => {
-  const { trackId } = req.params;
-  const { categorySlug, componentType, contributorFloId, metadata } =
-    req.body;
+// { contributorFloId, categorySlug, componentType, metadata, time, pubKey, sign }
+// Signed but not admin-gated - a creator registering their own track's
+// components is a normal action, just needs to actually be them.
+app.post(
+  "/api/tracks/:trackId/components",
+  verifyFloSignature(
+    ["trackId", "contributorFloId", "categorySlug", "componentType", "time"],
+    { floIdField: "contributorFloId" },
+  ),
+  async (req, res) => {
+    const { trackId } = req.params;
+    const { categorySlug, componentType, contributorFloId, metadata } =
+      req.body;
 
-  if (!categorySlug || !componentType || !contributorFloId) {
-    return res.status(400).json({
-      success: false,
-      error: "Missing categorySlug, componentType, or contributorFloId",
-    });
-  }
-
-  if (!ALL_COMPONENT_TYPES.includes(componentType)) {
-    return res.status(400).json({
-      success: false,
-      error: `componentType must be one of: ${ALL_COMPONENT_TYPES.join(", ")}`,
-    });
-  }
-
-  try {
-    const category = await pool.query(
-      "SELECT id FROM categories WHERE slug = $1",
-      [categorySlug],
-    );
-    if (!category.rows.length) {
-      return res
-        .status(404)
-        .json({ success: false, error: "Category not found" });
+    if (!categorySlug || !componentType || !contributorFloId) {
+      return res.status(400).json({
+        success: false,
+        error: "Missing categorySlug, componentType, or contributorFloId",
+      });
     }
 
-    const result = await pool.query(
-      `INSERT INTO tracks_components
+    if (!ALL_COMPONENT_TYPES.includes(componentType)) {
+      return res.status(400).json({
+        success: false,
+        error: `componentType must be one of: ${ALL_COMPONENT_TYPES.join(", ")}`,
+      });
+    }
+
+    try {
+      const category = await pool.query(
+        "SELECT id FROM categories WHERE slug = $1",
+        [categorySlug],
+      );
+      if (!category.rows.length) {
+        return res
+          .status(404)
+          .json({ success: false, error: "Category not found" });
+      }
+
+      const result = await pool.query(
+        `INSERT INTO tracks_components
         (track_id, category_id, component_type, contributor_flo_id, metadata)
        VALUES ($1, $2, $3, $4, $5)
        RETURNING *`,
-      [
-        trackId,
-        category.rows[0].id,
-        componentType,
-        contributorFloId,
-        metadata || {},
-      ],
-    );
+        [
+          trackId,
+          category.rows[0].id,
+          componentType,
+          contributorFloId,
+          metadata || {},
+        ],
+      );
 
-    res.json({ success: true, component: result.rows[0] });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ success: false, error: "Database error" });
-  }
-});
+      res.json({ success: true, component: result.rows[0] });
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ success: false, error: "Database error" });
+    }
+  },
+);
 
 // ---------------------------------------------------------------------
 // API: Properties
@@ -1419,57 +1477,65 @@ app.post(
   },
 );
 
-// POST /api/properties/:propertyId/usage-events
-// TODO: not auth-gated yet - anyone can log a usage event right now.
-// Needs an authorization model (who's allowed to log these), not just
-// identity verification, before this goes live.
-app.post("/api/properties/:propertyId/usage-events", rateLimit({ max: 20, windowMs: 60000 }), async (req, res) => {
-  const { propertyId } = req.params;
-  const {
-    componentId,
-    usageType,
-    actorFloId,
-    rightsDurationDays,
-    valueType,
-    valueAmount,
-    valueDescription,
-    metadata,
-  } = req.body;
+// POST /api/properties/:propertyId/usage-events - admin-only. Logging a
+// usage event directly moves utility_score (and so price), so it needs
+// to be gated to trusted admins, not just signed by any user.
+// { adminFloId, componentId, usageType, actorFloId, ..., time, pubKey, sign }
+app.post(
+  "/api/properties/:propertyId/usage-events",
+  rateLimit({ max: 20, windowMs: 60000 }),
+  verifyFloSignature(["propertyId", "adminFloId", "usageType", "time"], {
+    floIdField: "adminFloId",
+  }),
+  requireAdmin("adminFloId"),
+  async (req, res) => {
+    const { propertyId } = req.params;
+    const {
+      componentId,
+      usageType,
+      actorFloId,
+      rightsDurationDays,
+      valueType,
+      valueAmount,
+      valueDescription,
+      metadata,
+    } = req.body;
 
-  if (!usageType) {
-    return res
-      .status(400)
-      .json({ success: false, error: "Missing usageType" });
-  }
+    if (!usageType) {
+      return res
+        .status(400)
+        .json({ success: false, error: "Missing usageType" });
+    }
 
-  try {
-    const result = await pool.query(
-      `
+    try {
+      const result = await pool.query(
+        `
       INSERT INTO property_usage_events
         (property_id, component_id, usage_type, actor_flo_id,
          rights_duration_days, value_type, value_amount, value_description, metadata)
       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
       RETURNING *
       `,
-      [
-        propertyId,
-        componentId || null,
-        usageType,
-        actorFloId || null,
-        rightsDurationDays || null,
-        valueType || null,
-        valueAmount || null,
-        valueDescription || null,
-        metadata || {},
-      ],
-    );
+        [
+          propertyId,
+          componentId || null,
+          usageType,
+          actorFloId || null,
+          rightsDurationDays || null,
+          valueType || null,
+          valueAmount || null,
+          valueDescription || null,
+          metadata || {},
+        ],
+      );
 
-    res.json({ success: true, event: result.rows[0] });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ success: false, error: "Database error" });
-  }
-});
+      res.json({ success: true, event: result.rows[0] });
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ success: false, error: "Database error" });
+    }
+  },
+);
 
 // ---------------------------------------------------------------------
 // API: Financing
@@ -1573,41 +1639,51 @@ app.get("/api/tasks", async (req, res) => {
   }
 });
 
-// POST /api/tasks  { requesterFloId, brief, budget, componentType }
+// POST /api/tasks  { adminFloId, requesterFloId, brief, budget, componentType, time, pubKey, sign }
 // componentType is what kind of creative work this is asking for
 // ("generate lyrics for X") - optional, but when given must be one of
 // RANKABLE_COMPONENT_TYPES so it can be filtered/tagged consistently
 // with the rest of the marketplace.
-app.post("/api/tasks", async (req, res) => {
-  const { requesterFloId, brief, budget, componentType } = req.body;
+// Admin-only, same as categories/usage-events - keeps the task board
+// from being spammed with junk listings.
+app.post(
+  "/api/tasks",
+  verifyFloSignature(
+    ["adminFloId", "requesterFloId", "brief", "budget", "componentType", "time"],
+    { floIdField: "adminFloId" },
+  ),
+  requireAdmin("adminFloId"),
+  async (req, res) => {
+    const { requesterFloId, brief, budget, componentType } = req.body;
 
-  if (!requesterFloId || !brief) {
-    return res.status(400).json({
-      success: false,
-      error: "Missing requesterFloId or brief",
-    });
-  }
+    if (!requesterFloId || !brief) {
+      return res.status(400).json({
+        success: false,
+        error: "Missing requesterFloId or brief",
+      });
+    }
 
-  if (componentType && !RANKABLE_COMPONENT_TYPES.includes(componentType)) {
-    return res.status(400).json({
-      success: false,
-      error: `componentType must be one of: ${RANKABLE_COMPONENT_TYPES.join(", ")}`,
-    });
-  }
+    if (componentType && !RANKABLE_COMPONENT_TYPES.includes(componentType)) {
+      return res.status(400).json({
+        success: false,
+        error: `componentType must be one of: ${RANKABLE_COMPONENT_TYPES.join(", ")}`,
+      });
+    }
 
-  try {
-    const result = await pool.query(
-      `INSERT INTO tasks (requester_flo_id, brief, budget, component_type)
-       VALUES ($1, $2, $3, $4)
-       RETURNING *`,
-      [requesterFloId, brief, budget || null, componentType || null],
-    );
-    res.json({ success: true, task: result.rows[0] });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ success: false, error: "Database error" });
-  }
-});
+    try {
+      const result = await pool.query(
+        `INSERT INTO tasks (requester_flo_id, brief, budget, component_type)
+         VALUES ($1, $2, $3, $4)
+         RETURNING *`,
+        [requesterFloId, brief, budget || null, componentType || null],
+      );
+      res.json({ success: true, task: result.rows[0] });
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ success: false, error: "Database error" });
+    }
+  },
+);
 
 // POST /api/tasks/:taskId/claim  { creatorFloId, time, pubKey, sign }
 // Signed: hashcontent = [taskId, creatorFloId, time].join("|")
@@ -1720,16 +1796,22 @@ app.post(
 );
 
 // Manual trigger for the pipeline job - useful for testing without
-// waiting for the daily interval.
-app.post("/api/marketplace/run-pipeline", async (req, res) => {
-  try {
-    await runMarketplacePipeline();
-    res.json({ success: true });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ success: false, error: "Pipeline run failed" });
-  }
-});
+// waiting for the daily interval. Admin-only.
+// { adminFloId, time, pubKey, sign }
+app.post(
+  "/api/marketplace/run-pipeline",
+  verifyFloSignature(["adminFloId", "time"], { floIdField: "adminFloId" }),
+  requireAdmin("adminFloId"),
+  async (req, res) => {
+    try {
+      await runMarketplacePipeline();
+      res.json({ success: true });
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ success: false, error: "Pipeline run failed" });
+    }
+  },
+);
 
 // Start the server
 console.log("Starting MusicMarketplace Oracle...");
