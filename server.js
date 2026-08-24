@@ -2976,6 +2976,46 @@ app.post(
   },
 );
 
+// GET /api/main-token/sell-queue - public transparency metrics so sellers can see how fast the payout queue is moving right now.
+app.get("/api/main-token/sell-queue", async (req, res) => {
+  try {
+    const pendingResult = await pool.query(
+      `
+      SELECT COUNT(*)::int AS count,
+             COALESCE(SUM(token_amount - paid_amount), 0)::numeric AS outstanding_tokens,
+             MIN(requested_at) AS oldest_requested_at
+      FROM sell_queue
+      WHERE status != 'fulfilled'
+      `,
+    );
+
+    const [systemValuation, totalSupply, liquidityBuilt] = await Promise.all([
+      computeSystemValuation(),
+      getTotalMainTokenSupply(),
+      isPlatformLiquidityBuilt(),
+    ]);
+    const tokenPrice = computeMainTokenPrice(systemValuation, totalSupply);
+    const pressureRatio = await computeMainTokenPressureRatio();
+
+    const row = pendingResult.rows[0];
+    const outstandingTokens = Number(row?.outstanding_tokens || 0);
+    res.json({
+      success: true,
+      liquidityBuilt,
+      pendingCount: Number(row?.count || 0),
+      outstandingTokens,
+      outstandingUsdai: outstandingTokens * tokenPrice,
+      oldestRequestedAt: row?.oldest_requested_at || null,
+      tokenPrice,
+      pressureRatio7d: pressureRatio,
+      releaseFraction: computeSellReleaseFraction(pressureRatio),
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ success: false, error: "Database error" });
+  }
+});
+
 // usage event directly moves utility_score (and so price), so it needs
 // to be gated to trusted admins, not just signed by any user.
 // { adminFloId, componentId, usageType, actorFloId, ..., time, pubKey, sign }
