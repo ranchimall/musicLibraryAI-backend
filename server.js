@@ -1035,6 +1035,14 @@ async function ensureMarketplaceSchema() {
   await pool.query(`
     ALTER TABLE financing_positions ADD COLUMN IF NOT EXISTS property_id INT REFERENCES properties(id);
   `);
+  // Financing positions are funded by real USDAI payments - store the funding txid (unique when present, so a payment can't be reused).
+  await pool.query(`
+    ALTER TABLE financing_positions ADD COLUMN IF NOT EXISTS usdai_txid TEXT;
+  `);
+  await pool.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS financing_positions_usdai_txid_key
+      ON financing_positions (usdai_txid) WHERE usdai_txid IS NOT NULL;
+  `);
 
   console.log("Marketplace v3 schema ready (bundle properties)");
 }
@@ -2590,25 +2598,53 @@ app.post(
   },
 );
 
-// POST /api/properties/:propertyId/financing  { financierFloId, amount, revenueSharePct, time, pubKey, sign }
-// The "finance" leg of a bundle - not admin-gated, since backing a
-// property with your own money is a normal financier action (same as
-// the existing task/track financing endpoints below).
+// POST /api/properties/:propertyId/financing
+// { financierFloId, amount, revenueSharePct, usdaiTxid, time, pubKey, sign }
+// Real-money financing since the Main Token migration: the USDAI payment
+// sent to the USDAI payment address is verified on-chain, the position is
+// credited at its verified value (body.amount is treated as intent only),
+// and the funds go into the ONE shared liquidity pool after the platform
+// cut - same flow as Main Token buys.
 app.post(
   "/api/properties/:propertyId/financing",
-  verifyFloSignature(["propertyId", "financierFloId", "amount", "time"], {
-    floIdField: "financierFloId",
-  }),
+  verifyFloSignature(
+    ["propertyId", "financierFloId", "amount", "revenueSharePct", "usdaiTxid", "time"],
+    { floIdField: "financierFloId" },
+  ),
   async (req, res) => {
     const { propertyId } = req.params;
-    const { financierFloId, amount, revenueSharePct } = req.body;
+    const { financierFloId, revenueSharePct } = req.body;
+    const usdaiTxid = req.body.usdaiTxid;
 
-    if (!financierFloId || !amount) {
+    if (!financierFloId) {
+      return res
+        .status(400)
+        .json({ success: false, error: "Missing financierFloId" });
+    }
+    if (!usdaiTxid) {
       return res.status(400).json({
         success: false,
-        error: "Missing financierFloId or amount",
+        error:
+          "Missing usdaiTxid - send USDAI to the USDAI payment address first",
       });
     }
+
+    let usdaiValue;
+    try {
+      const payment = await verifyUsdaiPayment(
+        usdaiTxid,
+        MIN_INVESTMENT_USDAI,
+        financierFloId,
+      );
+      usdaiValue = payment.tokenAmount;
+    } catch (err) {
+      console.error("Financing payment verification failed:", err);
+      return res.status(402).json({
+        success: false,
+        error: `Payment verification failed: ${err.message || err}`,
+      });
+    }
+    const { expense, netAfterExpense } = splitInvestment(usdaiValue);
 
     try {
       const property = await pool.query(
@@ -2621,15 +2657,45 @@ app.post(
           .json({ success: false, error: "Property not found" });
       }
 
-      const result = await pool.query(
-        `INSERT INTO financing_positions
-          (property_id, financier_flo_id, stage, amount, revenue_share_pct)
-         VALUES ($1, $2, 'property_backing', $3, $4)
-         RETURNING *`,
-        [propertyId, financierFloId, amount, revenueSharePct || null],
-      );
+      const client = await pool.connect();
+      let position;
+      try {
+        await client.query("BEGIN");
+        try {
+          const inserted = await client.query(
+            `INSERT INTO financing_positions
+              (property_id, financier_flo_id, stage, amount, revenue_share_pct, usdai_txid)
+             VALUES ($1, $2, 'property_backing', $3, $4, $5)
+             RETURNING *`,
+            [propertyId, financierFloId, usdaiValue, revenueSharePct || null, usdaiTxid],
+          );
+          position = inserted.rows[0];
+        } catch (err) {
+          if (err.code === "23505") {
+            await client.query("ROLLBACK");
+            return res.status(409).json({
+              success: false,
+              error: "This payment has already been credited to a financing position",
+            });
+          }
+          throw err;
+        }
+        await depositToPlatformLiquidity(netAfterExpense, expense, client);
+        await client.query("COMMIT");
+      } catch (err) {
+        await client.query("ROLLBACK");
+        throw err;
+      } finally {
+        client.release();
+      }
 
-      res.json({ success: true, position: result.rows[0] });
+      res.json({
+        success: true,
+        position,
+        usdaiValue,
+        platformExpense: expense,
+        liquidityPoolDeposit: netAfterExpense,
+      });
     } catch (err) {
       console.error(err);
       res.status(500).json({ success: false, error: "Database error" });
@@ -2669,6 +2735,7 @@ app.post(
 );
 
 const MIN_MAIN_TOKEN_BUY_USDAI = 0.01; // dust floor, just enough to make sure a real payment happened
+const MIN_INVESTMENT_USDAI = 0.01; // same dust floor for financing positions (tasks, tracks, properties)
 
 // GET /api/main-token/price - current token price plus the numbers behind it
 app.get("/api/main-token/price", async (req, res) => {
@@ -2973,24 +3040,49 @@ app.post(
 // ---------------------------------------------------------------------
 
 // POST /api/financing/tasks/:taskId/back
-// { financierFloId, amount, revenueSharePct, time, pubKey, sign }
-// Signed: hashcontent = [taskId, financierFloId, amount, revenueSharePct, time].join("|")
+// { financierFloId, amount, revenueSharePct, usdaiTxid, time, pubKey, sign }
+// Real USDAI payment required - verified on-chain, credited at its verified
+// value, deposited into the one shared liquidity pool after the platform cut.
 app.post(
   "/api/financing/tasks/:taskId/back",
   verifyFloSignature(
-    ["taskId", "financierFloId", "amount", "revenueSharePct", "time"],
+    ["taskId", "financierFloId", "amount", "revenueSharePct", "usdaiTxid", "time"],
     { floIdField: "financierFloId" },
   ),
   async (req, res) => {
     const { taskId } = req.params;
-    const { financierFloId, amount, revenueSharePct } = req.body;
+    const { financierFloId, revenueSharePct } = req.body;
+    const usdaiTxid = req.body.usdaiTxid;
 
-    if (!financierFloId || !amount) {
+    if (!financierFloId) {
+      return res
+        .status(400)
+        .json({ success: false, error: "Missing financierFloId" });
+    }
+    if (!usdaiTxid) {
       return res.status(400).json({
         success: false,
-        error: "Missing financierFloId or amount",
+        error:
+          "Missing usdaiTxid - send USDAI to the USDAI payment address first",
       });
     }
+
+    let usdaiValue;
+    try {
+      const payment = await verifyUsdaiPayment(
+        usdaiTxid,
+        MIN_INVESTMENT_USDAI,
+        financierFloId,
+      );
+      usdaiValue = payment.tokenAmount;
+    } catch (err) {
+      console.error("Financing payment verification failed:", err);
+      return res.status(402).json({
+        success: false,
+        error: `Payment verification failed: ${err.message || err}`,
+      });
+    }
+    const { expense, netAfterExpense } = splitInvestment(usdaiValue);
 
     try {
       const task = await pool.query("SELECT id FROM tasks WHERE id = $1", [
@@ -3002,15 +3094,45 @@ app.post(
           .json({ success: false, error: "Task not found" });
       }
 
-      const result = await pool.query(
-        `INSERT INTO financing_positions
-          (task_id, financier_flo_id, stage, amount, revenue_share_pct)
-         VALUES ($1, $2, 'pre_creation', $3, $4)
-         RETURNING *`,
-        [taskId, financierFloId, amount, revenueSharePct || null],
-      );
+      const client = await pool.connect();
+      let position;
+      try {
+        await client.query("BEGIN");
+        try {
+          const inserted = await client.query(
+            `INSERT INTO financing_positions
+              (task_id, financier_flo_id, stage, amount, revenue_share_pct, usdai_txid)
+             VALUES ($1, $2, 'pre_creation', $3, $4, $5)
+             RETURNING *`,
+            [taskId, financierFloId, usdaiValue, revenueSharePct || null, usdaiTxid],
+          );
+          position = inserted.rows[0];
+        } catch (err) {
+          if (err.code === "23505") {
+            await client.query("ROLLBACK");
+            return res.status(409).json({
+              success: false,
+              error: "This payment has already been credited to a financing position",
+            });
+          }
+          throw err;
+        }
+        await depositToPlatformLiquidity(netAfterExpense, expense, client);
+        await client.query("COMMIT");
+      } catch (err) {
+        await client.query("ROLLBACK");
+        throw err;
+      } finally {
+        client.release();
+      }
 
-      res.json({ success: true, position: result.rows[0] });
+      res.json({
+        success: true,
+        position,
+        usdaiValue,
+        platformExpense: expense,
+        liquidityPoolDeposit: netAfterExpense,
+      });
     } catch (err) {
       console.error(err);
       res.status(500).json({ success: false, error: "Database error" });
@@ -3019,35 +3141,90 @@ app.post(
 );
 
 // POST /api/financing/tracks/:trackId/invest
-// { financierFloId, amount, revenueSharePct, time, pubKey, sign }
-// Signed: hashcontent = [trackId, financierFloId, amount, revenueSharePct, time].join("|")
+// { financierFloId, amount, revenueSharePct, usdaiTxid, time, pubKey, sign }
+// Real USDAI payment required - verified on-chain, credited at its verified
+// value, deposited into the one shared liquidity pool after the platform cut.
 app.post(
   "/api/financing/tracks/:trackId/invest",
   verifyFloSignature(
-    ["trackId", "financierFloId", "amount", "revenueSharePct", "time"],
+    ["trackId", "financierFloId", "amount", "revenueSharePct", "usdaiTxid", "time"],
     { floIdField: "financierFloId" },
   ),
   async (req, res) => {
     const { trackId } = req.params;
-    const { financierFloId, amount, revenueSharePct } = req.body;
+    const { financierFloId, revenueSharePct } = req.body;
+    const usdaiTxid = req.body.usdaiTxid;
 
-    if (!financierFloId || !amount) {
+    if (!financierFloId) {
+      return res
+        .status(400)
+        .json({ success: false, error: "Missing financierFloId" });
+    }
+    if (!usdaiTxid) {
       return res.status(400).json({
         success: false,
-        error: "Missing financierFloId or amount",
+        error:
+          "Missing usdaiTxid - send USDAI to the USDAI payment address first",
       });
     }
 
+    let usdaiValue;
     try {
-      const result = await pool.query(
-        `INSERT INTO financing_positions
-          (track_id, financier_flo_id, stage, amount, revenue_share_pct)
-         VALUES ($1, $2, 'post_production', $3, $4)
-         RETURNING *`,
-        [trackId, financierFloId, amount, revenueSharePct || null],
+      const payment = await verifyUsdaiPayment(
+        usdaiTxid,
+        MIN_INVESTMENT_USDAI,
+        financierFloId,
       );
+      usdaiValue = payment.tokenAmount;
+    } catch (err) {
+      console.error("Financing payment verification failed:", err);
+      return res.status(402).json({
+        success: false,
+        error: `Payment verification failed: ${err.message || err}`,
+      });
+    }
+    const { expense, netAfterExpense } = splitInvestment(usdaiValue);
 
-      res.json({ success: true, position: result.rows[0] });
+    try {
+      const client = await pool.connect();
+      let position;
+      try {
+        await client.query("BEGIN");
+        try {
+          const inserted = await client.query(
+            `INSERT INTO financing_positions
+              (track_id, financier_flo_id, stage, amount, revenue_share_pct, usdai_txid)
+             VALUES ($1, $2, 'post_production', $3, $4, $5)
+             RETURNING *`,
+            [trackId, financierFloId, usdaiValue, revenueSharePct || null, usdaiTxid],
+          );
+          position = inserted.rows[0];
+        } catch (err) {
+          if (err.code === "23505") {
+            await client.query("ROLLBACK");
+            return res.status(409).json({
+              success: false,
+              error: "This payment has already been credited to a financing position",
+            });
+          }
+          throw err;
+        }
+        await depositToPlatformLiquidity(netAfterExpense, expense, client);
+        await client.query("COMMIT");
+      } catch (err) {
+        await client.query("ROLLBACK");
+        throw err;
+      } finally {
+        client.release();
+      }
+
+      res.json({
+        success: true,
+        position,
+        usdaiValue,
+        platformExpense: expense,
+        liquidityPoolDeposit: netAfterExpense,
+      });
     } catch (err) {
       console.error(err);
       res.status(500).json({ success: false, error: "Database error" });
