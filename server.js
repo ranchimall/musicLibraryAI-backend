@@ -6,6 +6,7 @@ const { verifyFloSignature } = require("./flo-auth");
 const {
   verifyFloPayment,
   sendFloPayment,
+  sendUsdaiPayment,
   MARKETPLACE_FLO_ADDRESS,
 } = require("./flo-chain");
 
@@ -560,17 +561,140 @@ const PROPERTY_COMPONENT_TYPES = ["lyrics", "music", "vocals", "marketing"];
 // and the two /api/financing/* endpoints below).
 const ALL_COMPONENT_TYPES = [...PROPERTY_COMPONENT_TYPES];
 
-// consecutive high-scarcity pipeline runs required before minting a new slot
-const SLOT_RELEASE_SUSTAINED_RUNS = 3;
-const SLOT_RELEASE_SCARCITY_THRESHOLD = 2.0;
-
 // Price model weights.
 const PRICE_ALPHA = 0.15;
 const PRICE_BETA = 0.15;
-const BASE_PROPERTY_PRICE = 1;
+
+// --- Main Token economy -------------------------------------------------
+// base_price is per-property, driven by consumption. Main Token,
+// liquidity, sell-gating, and payouts are a layer on top of the existing
+// scarcity/utility/price/Top 100 system.
+//
+// The numbers below are placeholders until there's real trading data to
+// tune them against.
+const PER_UNIT_VALUE = 1; // $ per consumption unit - a $1/view starting anchor, purely a placeholder
+const PLATFORM_EXPENSE_PCT = 0.05; // cut taken before anything hits liquidity
+const PLATFORM_LIQUIDITY_TARGET = 10000; // one shared pool, needed before selling OR contributor payouts open at all
+const SELL_PRESSURE_FLOOR = 1.0; // buy/sell ratio at or below this = queue stays fully closed
+const SELL_PRESSURE_CEILING = 3.0; // ratio at or above this = queue fully released
+const PORTFOLIO_FLOOR_SHARE = 0.002; // no property in the Top 100 gets less than this share of new investment
+const CONTRIBUTOR_RELEASE_PCT = 0.1; // Percentage of the shared pool released for contributor payouts each cycle
+const PER_TRACK_MIN_PAYOUT = 5; // a track's pending payout has to clear this before it actually pays out
+const CONSUMPTION_GROWTH_BURN_THRESHOLD = 0.02; // growth rate below which the future token-burn mechanism is meant to trigger - see isConsumptionGrowthFlat
+
+// --- USDAI payment verification (Main Token buy) ---------------------------
+// Main Token is priced in USDAI directly - USDAI is RanchiMall's own token on the FLO blockchain, assumed to equal $1. A USDAI transfer is verified through the token API rather than a plain FLO balance check, and both sender and receiver are checked against the live response.
+const TOKEN_API_BASE_URL =
+  process.env.TOKEN_API_BASE_URL ||
+  "https://ranchimallflo.ranchimall.net/api/v2";
+const USDAI_TOKEN_IDENTIFIER = process.env.USDAI_TOKEN_IDENTIFIER || "usdai";
+const USDAI_PAYMENT_ADDRESS = process.env.USDAI_PAYMENT_ADDRESS;
+const SENDER_FIELD_CANDIDATES = ["senderAddress"];
+const DEST_FIELD_CANDIDATES = ["receiverAddress"];
+
+async function verifyUsdaiPayment(txid, requiredAmount, expectedSender) {
+  if (!txid || typeof txid !== "string") {
+    throw new Error("Missing USDAI transaction ID");
+  }
+
+  const response = await fetch(
+    `${TOKEN_API_BASE_URL}/transactionDetails/${txid}`,
+    { signal: AbortSignal.timeout(8000) },
+  );
+  if (!response.ok) {
+    throw new Error(`Token API returned ${response.status} for txid ${txid}`);
+  }
+  const data = await response.json();
+
+  const tx = data;
+  if (!tx) {
+    throw new Error(`Unexpected token API response shape for txid ${txid}`);
+  }
+
+  if (
+    String(tx.tokenIdentification || "").toLowerCase() !==
+    USDAI_TOKEN_IDENTIFIER.toLowerCase()
+  ) {
+    throw new Error(
+      `Transaction ${txid} is not a ${USDAI_TOKEN_IDENTIFIER} transfer (got ${tx.tokenIdentification})`,
+    );
+  }
+  if (
+    tx.type !== "transfer" &&
+    tx.transferType !== "token" &&
+    tx.operation !== "token-transfer"
+  ) {
+    throw new Error(`Transaction ${txid} is not a token transfer`);
+  }
+
+  const tokenAmount = Number(tx.tokenAmount);
+  if (!Number.isFinite(tokenAmount) || tokenAmount < requiredAmount) {
+    throw new Error(
+      `Insufficient USDAI in transaction ${txid}: got ${tokenAmount}, required ${requiredAmount}`,
+    );
+  }
+
+  if (!tx.confirmations || tx.confirmations < 1) {
+    throw new Error(`Transaction ${txid} is not confirmed yet`);
+  }
+
+  let senderField = null;
+  for (const candidate of SENDER_FIELD_CANDIDATES) {
+    if (tx[candidate]) {
+      senderField = tx[candidate];
+      break;
+    }
+  }
+  if (!senderField) {
+    throw new Error(
+      `Could not find a sender address field on txid ${txid} using any of ` +
+        `[${SENDER_FIELD_CANDIDATES.join(", ")}] - refusing rather than skipping ` +
+        "the sender check. Confirm the real field name against the live API response.",
+    );
+  }
+  if (senderField !== expectedSender) {
+    throw new Error(
+      `Transaction ${txid} was sent by ${senderField}, not ${expectedSender}`,
+    );
+  }
+
+  // Make sure the payment reached the right address.
+  if (!USDAI_PAYMENT_ADDRESS) {
+    throw new Error("Payments not configured (USDAI_PAYMENT_ADDRESS unset)");
+  }
+  let destField = null;
+  for (const candidate of DEST_FIELD_CANDIDATES) {
+    if (tx[candidate]) {
+      destField = tx[candidate];
+      break;
+    }
+  }
+  if (!destField) {
+    throw new Error(
+      `Could not find a destination address field on txid ${txid} using any of ` +
+        `[${DEST_FIELD_CANDIDATES.join(", ")}] - refusing rather than skipping ` +
+        "the destination check. Confirm the real field name against the live API response.",
+    );
+  }
+  if (destField !== USDAI_PAYMENT_ADDRESS) {
+    throw new Error(
+      `Transaction ${txid} was sent to ${destField}, not the USDAI payment address`,
+    );
+  }
+
+  return {
+    valid: true,
+    txid,
+    tokenAmount,
+    confirmations: tx.confirmations,
+    sender: senderField,
+  };
+}
+
+const VALUATION_FORMULA_VERSION = "v1-per-unit-value";
 
 // ---------------------------------------------------------------------
-// Schema setup - runs on boot, idempotent (safe to re-run on every deploy)
+// Schema setup
 // ---------------------------------------------------------------------
 async function ensureMarketplaceSchema() {
   // plays/likes belong to the original track-library feature
@@ -635,7 +759,6 @@ async function ensureMarketplaceSchema() {
     CREATE TABLE IF NOT EXISTS properties (
       id                SERIAL PRIMARY KEY,
       category_id       INT REFERENCES categories(id),
-      component_type    TEXT,
       status            TEXT DEFAULT 'active',
       total_slots       INT DEFAULT 5,
       scarcity_score    NUMERIC DEFAULT 0,
@@ -658,25 +781,151 @@ async function ensureMarketplaceSchema() {
   await pool.query(`
     ALTER TABLE properties ADD COLUMN IF NOT EXISTS in_top_100 BOOLEAN DEFAULT false;
   `);
-  // Kept for compatibility with older property records.
-  // New bundle properties do not use component_type.
+  // consumption drives base_price now (see calculateBasePrice) - kept
+  // alongside scarcity_score/utility_score above, doesn't replace them.
   await pool.query(`
-    ALTER TABLE properties ALTER COLUMN component_type DROP NOT NULL;
+    ALTER TABLE properties ADD COLUMN IF NOT EXISTS consumption NUMERIC DEFAULT 0;
+  `);
+  await pool.query(`
+    ALTER TABLE properties ADD COLUMN IF NOT EXISTS base_price NUMERIC DEFAULT 0;
+  `);
+  await pool.query(`
+    ALTER TABLE properties ADD COLUMN IF NOT EXISTS valuation_updated_at TIMESTAMPTZ;
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS property_valuation_history (
+      id                SERIAL PRIMARY KEY,
+      property_id       INT REFERENCES properties(id),
+      consumption       NUMERIC NOT NULL,
+      base_price        NUMERIC NOT NULL,
+      formula_version   TEXT NOT NULL,
+      created_at        TIMESTAMPTZ DEFAULT now()
+    );
+  `);
+
+  // --- Main Token ledger ---------------------------------------------------
+  // Still just a DB ledger, not an on-chain token - that's a later phase.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS main_token_balances (
+      flo_id          TEXT PRIMARY KEY,
+      balance         NUMERIC DEFAULT 0,
+      updated_at      TIMESTAMPTZ DEFAULT now()
+    );
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS main_token_transactions (
+      id              SERIAL PRIMARY KEY,
+      flo_id          TEXT NOT NULL,
+      type            TEXT NOT NULL,
+      token_amount    NUMERIC NOT NULL,
+      price_at_time   NUMERIC NOT NULL,
+      payment_txid    TEXT,
+      created_at      TIMESTAMPTZ DEFAULT now()
+    );
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS main_token_price_history (
+      id                SERIAL PRIMARY KEY,
+      price             NUMERIC NOT NULL,
+      total_supply      NUMERIC NOT NULL,
+      system_valuation  NUMERIC NOT NULL,
+      recorded_at       TIMESTAMPTZ DEFAULT now()
+    );
+  `);
+  // Prevent the same payment transaction from being redeemed more than once.
+  try {
+    await pool.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS main_token_transactions_payment_txid_unique
+      ON main_token_transactions (payment_txid) WHERE payment_txid IS NOT NULL;
+    `);
+  } catch (err) {
+    console.error(
+      "WARNING: could not create unique index on main_token_transactions.payment_txid " +
+        "(likely pre-existing duplicates) - txid replay protection is NOT active:",
+      err,
+    );
+  }
+
+  // --- Platform liquidity ---------------------------------------------------
+  // One platform-wide balance that has to fill up before selling opens at all - selling stays fully closed until this crosses liquidity_target.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS platform_liquidity (
+      id                SERIAL PRIMARY KEY,
+      balance           NUMERIC DEFAULT 0,
+      expenses_taken    NUMERIC DEFAULT 0,
+      liquidity_target  NUMERIC,
+      updated_at        TIMESTAMPTZ DEFAULT now()
+    );
+  `);
+
+  // --- Sell-gating -----------------------------------------------------------
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS sell_queue (
+      id              SERIAL PRIMARY KEY,
+      flo_id          TEXT NOT NULL,
+      token_amount    NUMERIC NOT NULL,
+      requested_at    TIMESTAMPTZ DEFAULT now(),
+      released_amount NUMERIC DEFAULT 0,
+      status          TEXT DEFAULT 'queued'
+    );
   `);
 
   await pool.query(`
-    ALTER TABLE properties DROP CONSTRAINT IF EXISTS properties_category_id_component_type_key;
+    CREATE TABLE IF NOT EXISTS property_payouts (
+      id                SERIAL PRIMARY KEY,
+      property_id       INT REFERENCES properties(id),
+      component_id      INT REFERENCES tracks_components(id),
+      recipient_flo_id  TEXT NOT NULL,
+      amount            NUMERIC NOT NULL,
+      status            TEXT DEFAULT 'pending',
+      created_at        TIMESTAMPTZ DEFAULT now()
+    );
+  `);
+  // status also uses 'sending' (claimed by an in-progress payout run) and
+  // 'paid' (actually sent) - see executePropertyPayouts.
+  await pool.query(`
+    ALTER TABLE property_payouts ADD COLUMN IF NOT EXISTS flo_txid TEXT;
+  `);
+  await pool.query(`
+    ALTER TABLE property_payouts ADD COLUMN IF NOT EXISTS paid_at TIMESTAMPTZ;
   `);
 
-  // Kept for backwards compatibility with existing historical data.
-  // New marketplace operations use property_components instead.
+  // tracks how much of a queued sell has actually been paid out in FLO so
+  // far, separate from released_amount (which just says how much is
+  // *allowed* to be sold) - lets executeReleasedSells() pick up only the
+  // newly-unlocked slice each time it runs.
   await pool.query(`
-    CREATE TABLE IF NOT EXISTS property_members (
-      property_id     INT REFERENCES properties(id),
-      component_id    INT REFERENCES tracks_components(id),
-      rank            INT NOT NULL,
-      snapshot_at     TIMESTAMPTZ NOT NULL,
-      PRIMARY KEY (property_id, component_id, snapshot_at)
+    ALTER TABLE sell_queue ADD COLUMN IF NOT EXISTS paid_amount NUMERIC DEFAULT 0;
+  `);
+  // Written the moment a payout send succeeds, before any other
+  // bookkeeping - so if the rest of that bookkeeping fails, the txid
+  // still exists somewhere other than a console log.
+  await pool.query(`
+    ALTER TABLE sell_queue ADD COLUMN IF NOT EXISTS payout_txid TEXT;
+  `);
+
+  // --- User portfolio (holdings resulting from Main Token buys) -----------
+  // One row per (holder, property) they're currently exposed to through
+  // Main Token. Rebalanced on every pipeline run as Top 100 changes -
+  // see rebalancePortfolioPositions().
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS portfolio_positions (
+      flo_id          TEXT NOT NULL,
+      property_id     INT NOT NULL REFERENCES properties(id),
+      token_amount    NUMERIC NOT NULL DEFAULT 0,
+      allocation_pct  NUMERIC NOT NULL DEFAULT 0,
+      value           NUMERIC NOT NULL DEFAULT 0,
+      updated_at      TIMESTAMPTZ DEFAULT now(),
+      PRIMARY KEY (flo_id, property_id)
+    );
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS portfolio_snapshots (
+      id              SERIAL PRIMARY KEY,
+      flo_id          TEXT NOT NULL,
+      total_value     NUMERIC NOT NULL,
+      token_price     NUMERIC NOT NULL,
+      created_at      TIMESTAMPTZ DEFAULT now()
     );
   `);
 
@@ -706,53 +955,6 @@ async function ensureMarketplaceSchema() {
       PRIMARY KEY (property_id, person_flo_id, role)
     );
   `);
-
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS property_slots (
-      id              SERIAL PRIMARY KEY,
-      property_id     INT REFERENCES properties(id),
-      slot_index      INT NOT NULL,
-      owner_flo_id    TEXT,
-      acquired_at     TIMESTAMPTZ,
-      acquired_price  NUMERIC,
-      eligible_to_sell_at TIMESTAMPTZ,
-      UNIQUE (property_id, slot_index)
-    );
-  `);
-  // Set true while a sell's on-chain payout is in flight (between the
-  // validate-and-commit step and the pay-then-finalize step below) so a
-  // second concurrent sell request on the same slot can't also trigger a
-  // payout before the first one finalizes.
-  await pool.query(`
-    ALTER TABLE property_slots ADD COLUMN IF NOT EXISTS pending_payout BOOLEAN DEFAULT false;
-  `);
-
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS property_transactions (
-      id            SERIAL PRIMARY KEY,
-      property_id   INT REFERENCES properties(id),
-      slot_id       INT REFERENCES property_slots(id),
-      type          TEXT NOT NULL,
-      flo_id        TEXT NOT NULL,
-      price         NUMERIC NOT NULL,
-      flo_txid      TEXT,
-      created_at    TIMESTAMPTZ DEFAULT now()
-    );
-  `);
-  // Prevent the same FLO transaction from being used more than once.
-  // Ignore NULL txids so older transactions remain valid.
-  try {
-    await pool.query(`
-      CREATE UNIQUE INDEX IF NOT EXISTS property_transactions_flo_txid_unique
-      ON property_transactions (flo_txid) WHERE flo_txid IS NOT NULL;
-    `);
-  } catch (err) {
-    console.error(
-      "WARNING: could not create unique index on property_transactions.flo_txid " +
-        "(likely pre-existing duplicates) - txid replay protection is NOT active:",
-      err,
-    );
-  }
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS property_interest (
@@ -867,6 +1069,11 @@ function rateLimit({ windowMs = 60 * 1000, max = 20 } = {}) {
   };
 }
 
+function parsePositiveInt(value) {
+  const n = parseInt(value, 10);
+  return Number.isInteger(n) && n > 0 ? n : null;
+}
+
 // Admin allowlist for marketplace admin actions (creating categories,
 // logging usage events, manually triggering the pipeline). Configurable
 // via ADMIN_FLO_IDS (comma-separated) with a hardcoded default so this
@@ -962,19 +1169,647 @@ async function computeUtilityScore(propertyId) {
   return usageUtility + engagementProxy;
 }
 
-function computePrice(scarcityScore, utilityScore) {
+// basePrice used to always be BASE_PROPERTY_PRICE (a flat constant).
+// Now the caller passes in the property's own consumption-driven
+// base_price instead - the scarcity/utility math around it hasn't
+// changed at all.
+function computePrice(basePrice, scarcityScore, utilityScore) {
   return (
-    BASE_PROPERTY_PRICE *
+    basePrice *
     (1 + PRICE_ALPHA * scarcityScore) *
     (1 + PRICE_BETA * utilityScore)
   );
+}
+
+// consumption = plays + likes across the property's component tracks -
+// same join computeUtilityScore already uses for its engagement proxy,
+// just summing raw counts instead of log-scaling them.
+async function computePropertyConsumption(propertyId) {
+  const result = await pool.query(
+    `
+    WITH members AS (
+      SELECT DISTINCT tc.track_id
+      FROM property_components pc
+      JOIN tracks_components tc ON tc.id = pc.component_id
+      WHERE pc.property_id = $1
+    ),
+    play_totals AS (
+      SELECT COALESCE(SUM(p.play_count), 0)::numeric AS total_plays
+      FROM plays p
+      JOIN members m ON m.track_id = p.track_id
+    ),
+    like_totals AS (
+      SELECT COUNT(*)::numeric AS total_likes
+      FROM likes l
+      JOIN members m ON m.track_id = l.track_id
+    )
+    SELECT play_totals.total_plays + like_totals.total_likes AS total_consumption
+    FROM play_totals, like_totals
+    `,
+    [propertyId],
+  );
+  return Number(result.rows[0]?.total_consumption || 0);
+}
+
+// Base property price is determined by consumption and the configured per-unit value.
+function calculateBasePrice(consumption) {
+  return consumption * PER_UNIT_VALUE;
+}
+
+async function recordValuation(propertyId, consumption, basePrice) {
+  await pool.query(
+    `
+    INSERT INTO property_valuation_history
+      (property_id, consumption, base_price, formula_version)
+    VALUES ($1, $2, $3, $4)
+    `,
+    [propertyId, consumption, basePrice, VALUATION_FORMULA_VERSION],
+  );
+}
+
+// --- Main Token price -------------------------------------------------------
+// token_price = system_valuation / total_token_supply. Whenever
+// consumption grows faster than new tokens get issued, price goes up -
+// Main Token price is based on system valuation and total token supply.
+async function getTotalMainTokenSupply() {
+  const result = await pool.query(
+    `SELECT COALESCE(SUM(balance), 0)::numeric AS total FROM main_token_balances`,
+  );
+  return Number(result.rows[0]?.total || 0);
+}
+
+function computeMainTokenPrice(systemValuation, totalSupply) {
+  // nobody holds any tokens yet - price isn't meaningful, just anchor it
+  // to system_valuation so the first buyer gets a sane starting price.
+  if (totalSupply <= 0) return systemValuation > 0 ? systemValuation : 1;
+  return systemValuation / totalSupply;
+}
+
+async function recordMainTokenPrice(price, totalSupply, systemValuation) {
+  await pool.query(
+    `
+    INSERT INTO main_token_price_history (price, total_supply, system_valuation)
+    VALUES ($1, $2, $3)
+    `,
+    [price, totalSupply, systemValuation],
+  );
+}
+
+// Not called anywhere yet - the design calls for burning tokens once consumption growth flattens out, to keep token price growing after the consumption-driven half of the valuation plateaus. This is the detection check for that; the actual burn logic doesn't exist yet.
+function isConsumptionGrowthFlat(previousValuation, currentValuation) {
+  if (!previousValuation) return false;
+  const growthRate = (currentValuation - previousValuation) / previousValuation;
+  return growthRate < CONSUMPTION_GROWTH_BURN_THRESHOLD;
+}
+
+// --- Platform liquidity -----------------------------------------------------
+// One shared pool backs seller and contributor payouts.
+function splitInvestment(grossAmount) {
+  const expense = grossAmount * PLATFORM_EXPENSE_PCT;
+  const netAfterExpense = grossAmount - expense;
+  return { expense, netAfterExpense };
+}
+
+async function depositToPlatformLiquidity(
+  netAmount,
+  expense = 0,
+  dbClient = pool,
+) {
+  await dbClient.query(
+    `
+    INSERT INTO platform_liquidity (id, balance, expenses_taken, liquidity_target)
+    VALUES (1, $1, $2, $3)
+    ON CONFLICT (id) DO UPDATE
+    SET balance = platform_liquidity.balance + $1,
+        expenses_taken = platform_liquidity.expenses_taken + $2,
+        updated_at = now()
+    `,
+    [netAmount, expense, PLATFORM_LIQUIDITY_TARGET],
+  );
+  return { netAmount, expense };
+}
+
+async function reservePlatformLiquidity(dbClient, amount) {
+  const result = await dbClient.query(
+    `SELECT balance FROM platform_liquidity WHERE id = 1 FOR UPDATE`,
+  );
+  const balance = Number(result.rows[0]?.balance || 0);
+  if (balance < amount) {
+    return false;
+  }
+  await dbClient.query(
+    `UPDATE platform_liquidity SET balance = balance - $1, updated_at = now() WHERE id = 1`,
+    [amount],
+  );
+  return true;
+}
+
+async function isPlatformLiquidityBuilt() {
+  const result = await pool.query(
+    `SELECT balance, liquidity_target FROM platform_liquidity WHERE id = 1`,
+  );
+  const row = result.rows[0];
+  if (!row) return false;
+  return (
+    Number(row.balance) >=
+    Number(row.liquidity_target || PLATFORM_LIQUIDITY_TARGET)
+  );
+}
+
+// --- Sell-gating -------------------------------------------------------------
+// Same buy/sell-intent idea as computeScarcityScore, just at the Main
+// Token level instead of per property.
+async function computeMainTokenPressureRatio() {
+  const buyResult = await pool.query(
+    `
+    SELECT COALESCE(SUM(token_amount), 0)::numeric AS total
+    FROM main_token_transactions
+    WHERE type = 'buy' AND created_at > now() - INTERVAL '7 days'
+    `,
+  );
+  const sellResult = await pool.query(
+    `
+    SELECT COALESCE(SUM(token_amount), 0)::numeric AS total
+    FROM sell_queue
+    WHERE requested_at > now() - INTERVAL '7 days'
+    `,
+  );
+  const buyVolume = Number(buyResult.rows[0]?.total || 0);
+  const sellVolume = Number(sellResult.rows[0]?.total || 0);
+  return buyVolume / Math.max(sellVolume, 1);
+}
+
+// 0 below SELL_PRESSURE_FLOOR, scaling straight up to 1 at
+// SELL_PRESSURE_CEILING - kept linear for now, exact curve shape TBD.
+function computeSellReleaseFraction(pressureRatio) {
+  const span = SELL_PRESSURE_CEILING - SELL_PRESSURE_FLOOR;
+  const raw = (pressureRatio - SELL_PRESSURE_FLOOR) / span;
+  return Math.min(Math.max(raw, 0), 1);
+}
+
+// Releases the oldest queued requests first, in proportion to
+// releaseFraction. This only marks how much of each request is allowed
+// to settle; executeReleasedSells() performs the actual payout.
+async function releaseSellQueue() {
+  const liquidityBuilt = await isPlatformLiquidityBuilt();
+  if (!liquidityBuilt) return { releaseFraction: 0, updated: 0 };
+
+  const pressureRatio = await computeMainTokenPressureRatio();
+  const releaseFraction = computeSellReleaseFraction(pressureRatio);
+
+  const queued = await pool.query(
+    `
+    SELECT id, token_amount, released_amount FROM sell_queue
+    WHERE status IN ('queued', 'partially_released')
+    ORDER BY requested_at ASC
+    `,
+  );
+
+  let updated = 0;
+  for (const row of queued.rows) {
+    const targetReleased = Number(row.token_amount) * releaseFraction;
+    if (targetReleased <= Number(row.released_amount)) continue;
+
+    const fulfilled = targetReleased >= Number(row.token_amount);
+    await pool.query(
+      `
+      UPDATE sell_queue
+      SET released_amount = $1,
+          status = $2
+      WHERE id = $3
+      `,
+      [
+        fulfilled ? row.token_amount : targetReleased,
+        fulfilled ? "fulfilled" : "partially_released",
+        row.id,
+      ],
+    );
+    updated += 1;
+  }
+
+  return { releaseFraction, updated };
+}
+
+// --- Portfolio allocation across the Top 100 --------------------------------
+// Buying Main Token buys a slice of the whole Top-100 portfolio, weighted
+// by each property's consumption, with a floor so nobody in the Top 100
+// ever gets zero. The contributor payout cycle below reuses this too -
+// same rule, same floor, in both places.
+function computePortfolioAllocation(top100Properties) {
+  const totalConsumption = top100Properties.reduce(
+    (sum, p) => sum + Number(p.consumption || 0),
+    0,
+  );
+  if (totalConsumption <= 0 || top100Properties.length === 0) return [];
+
+  const rawShares = top100Properties.map((p) => ({
+    property_id: p.id,
+    share: Math.max(
+      Number(p.consumption || 0) / totalConsumption,
+      PORTFOLIO_FLOOR_SHARE,
+    ),
+  }));
+
+  // floors push the total above 1 - renormalize so shares actually sum to 1
+  const total = rawShares.reduce((sum, s) => sum + s.share, 0);
+  return rawShares.map((s) => ({
+    property_id: s.property_id,
+    share: s.share / total,
+  }));
+}
+
+// --- Contributor payouts -----------------------------------------------------
+// Draws from the same shared pool and liquidity_target that gates Main
+// Token selling. Each cycle releases a slice, splits it across the
+// current Top 100 by consumption, then splits each property's share
+// across its components by their own consumption. Fraud/fairness
+// adjustment is not yet implemented.
+async function releaseContributorPayouts() {
+  const liquidityBuilt = await isPlatformLiquidityBuilt();
+  if (!liquidityBuilt)
+    return { released: false, reason: "still building liquidity" };
+
+  const poolResult = await pool.query(
+    `SELECT balance FROM platform_liquidity WHERE id = 1`,
+  );
+  const poolBalance = Number(poolResult.rows[0]?.balance || 0);
+  const releaseAmount = poolBalance * CONTRIBUTOR_RELEASE_PCT;
+  if (releaseAmount <= 0)
+    return { released: false, reason: "nothing to release" };
+
+  const top100 = await pool.query(
+    "SELECT id, consumption FROM properties WHERE in_top_100 = true",
+  );
+  const allocation = computePortfolioAllocation(top100.rows);
+
+  let totalCreated = 0;
+  for (const a of allocation) {
+    const propertyReleaseAmount = releaseAmount * a.share;
+
+    // Same consumption metric used everywhere else: plays + likes, not
+    // plays alone.
+    const componentsResult = await pool.query(
+      `
+      SELECT tc.id AS component_id, tc.contributor_flo_id,
+             COALESCE(play_totals.total_plays, 0) + COALESCE(like_totals.total_likes, 0) AS consumption
+      FROM property_components pc
+      JOIN tracks_components tc ON tc.id = pc.component_id
+      LEFT JOIN (
+        SELECT track_id, SUM(play_count)::numeric AS total_plays FROM plays GROUP BY track_id
+      ) play_totals ON play_totals.track_id = tc.track_id
+      LEFT JOIN (
+        SELECT track_id, COUNT(*)::numeric AS total_likes FROM likes GROUP BY track_id
+      ) like_totals ON like_totals.track_id = tc.track_id
+      WHERE pc.property_id = $1
+      `,
+      [a.property_id],
+    );
+
+    const totalComponentConsumption = componentsResult.rows.reduce(
+      (sum, r) => sum + Number(r.consumption),
+      0,
+    );
+    if (totalComponentConsumption <= 0) continue;
+
+    for (const row of componentsResult.rows) {
+      // TODO: real fraud/fairness signal not built yet
+      const share = Number(row.consumption) / totalComponentConsumption;
+      const amount = propertyReleaseAmount * share;
+      if (amount < PER_TRACK_MIN_PAYOUT) continue; // held back, doesn't pay out this round
+
+      await pool.query(
+        `
+        INSERT INTO property_payouts (property_id, component_id, recipient_flo_id, amount, status)
+        VALUES ($1, $2, $3, $4, 'pending')
+        `,
+        [a.property_id, row.component_id, row.contributor_flo_id, amount],
+      );
+      totalCreated += amount;
+    }
+  }
+
+  // These are still pending, so the pool isn't touched yet.
+  return { released: true, created: totalCreated };
+}
+
+// Claims each payout, reserves the pool balance, then sends USDAI.
+async function executePropertyPayouts() {
+  const pendingResult = await pool.query(
+    `SELECT id FROM property_payouts WHERE status = 'pending'`,
+  );
+
+  let paid = 0;
+  let failed = 0;
+
+  for (const { id } of pendingResult.rows) {
+    const client = await pool.connect();
+    let payout;
+    try {
+      await client.query("BEGIN");
+      const claimed = await client.query(
+        `SELECT * FROM property_payouts WHERE id = $1 AND status = 'pending' FOR UPDATE`,
+        [id],
+      );
+      if (!claimed.rows.length) {
+        // Another run claimed it first.
+        await client.query("ROLLBACK");
+        continue;
+      }
+      payout = claimed.rows[0];
+      const amount = Number(payout.amount);
+      const reserved = await reservePlatformLiquidity(client, amount);
+      if (!reserved) {
+        await client.query("ROLLBACK");
+        continue;
+      }
+      await client.query(
+        `UPDATE property_payouts SET status = 'sending' WHERE id = $1`,
+        [id],
+      );
+      await client.query("COMMIT");
+    } catch (err) {
+      await client.query("ROLLBACK");
+      console.error(`Failed to claim property payout ${id}:`, err);
+      failed += 1;
+      continue;
+    } finally {
+      client.release();
+    }
+
+    // Send USDAI directly.
+    const usdaiAmount = Number(payout.amount);
+
+    let payoutTxid;
+    try {
+      payoutTxid = await sendUsdaiPayment(payout.recipient_flo_id, usdaiAmount);
+    } catch (err) {
+      console.error(
+        `Property payout ${id} failed to send, reverting to pending:`,
+        err,
+      );
+      const refundClient = await pool.connect();
+      try {
+        await refundClient.query("BEGIN");
+        await refundClient.query(
+          `UPDATE property_payouts SET status = 'pending' WHERE id = $1`,
+          [id],
+        );
+        await refundClient.query(
+          `UPDATE platform_liquidity SET balance = balance + $1, updated_at = now() WHERE id = 1`,
+          [Number(payout.amount)],
+        );
+        await refundClient.query("COMMIT");
+      } catch (refundErr) {
+        await refundClient.query("ROLLBACK");
+        console.error(
+          `CRITICAL: failed to refund liquidity for property payout ${id}:`,
+          refundErr,
+        );
+      } finally {
+        refundClient.release();
+      }
+      failed += 1;
+      continue;
+    }
+
+    // Record the txid right away, best-effort, before anything else that
+    // could fail - if the finalize step below fails, this is the
+    // difference between "the txid is stuck in a log line" and "the
+    // txid is on the row, ready for reconciliation."
+    try {
+      await pool.query(
+        `UPDATE property_payouts SET flo_txid = $1 WHERE id = $2`,
+        [payoutTxid, id],
+      );
+    } catch (txidErr) {
+      console.error(
+        `Sent ${usdaiAmount} USDAI (txid ${payoutTxid}) for property payout ${id} ` +
+          "but failed to record the txid on the row:",
+        txidErr,
+      );
+    }
+
+    // The send already happened. This step just records it.
+    const payClient = await pool.connect();
+    try {
+      await payClient.query("BEGIN");
+      await payClient.query(
+        `UPDATE property_payouts SET status = 'paid', flo_txid = $1, paid_at = now() WHERE id = $2`,
+        [payoutTxid, id],
+      );
+      await payClient.query("COMMIT");
+      paid += 1;
+    } catch (err) {
+      await payClient.query("ROLLBACK");
+      console.error(
+        `CRITICAL: sent ${usdaiAmount} USDAI (txid ${payoutTxid}) for property payout ${id} ` +
+          "but marking it paid failed - needs manual reconciliation:",
+        err,
+      );
+      failed += 1;
+    } finally {
+      payClient.release();
+    }
+  }
+
+  return { paid, failed };
+}
+
+// Run contributor releases, then send the pending payouts.
+async function runContributorPayoutCycle() {
+  await releaseContributorPayouts();
+  return executePropertyPayouts();
+}
+
+// Standalone version of the sum the pipeline already does inline -
+// buy/sell endpoints need a fresh number too, not just once a day.
+async function computeSystemValuation() {
+  const result = await pool.query(
+    `SELECT COALESCE(SUM(base_price), 0)::numeric AS total FROM properties WHERE status = 'active'`,
+  );
+  return Number(result.rows[0]?.total || 0);
+}
+
+// --- Portfolio rebalancing ---------------------------------------------------
+// Each holder's position is a snapshot, not a fixed claim on specific
+// properties - every run, we take what a holder's portfolio is currently
+// worth, wipe their positions, and re-split that same value across
+// whatever's in the Top 100 now. That's what makes it "automatically
+// rebalance" - a property dropping out of the Top 100 doesn't leave a
+// holder stuck holding a dead asset, it just stops getting a share next
+// time this runs.
+// Rebalances from each holder's actual Main Token balance, not from the
+// old position rows - token_amount and value are different units
+// (token quantity vs. dollar value) and re-deriving totalValue from a
+// SUM(value) of prior positions would compound any drift between them.
+async function rebalancePortfolioPositions(top100Properties, tokenPrice) {
+  const allocation = computePortfolioAllocation(top100Properties);
+  if (!allocation.length) return { rebalanced: 0 };
+
+  const holders = await pool.query(
+    `SELECT flo_id, balance FROM main_token_balances WHERE balance > 0`,
+  );
+
+  let rebalanced = 0;
+  for (const { flo_id, balance } of holders.rows) {
+    const holderTokenBalance = Number(balance);
+    if (holderTokenBalance <= 0) continue;
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query(`DELETE FROM portfolio_positions WHERE flo_id = $1`, [
+        flo_id,
+      ]);
+      for (const a of allocation) {
+        const tokenAmount = holderTokenBalance * a.share;
+        const value = tokenAmount * tokenPrice;
+        await client.query(
+          `
+          INSERT INTO portfolio_positions (flo_id, property_id, token_amount, allocation_pct, value)
+          VALUES ($1, $2, $3, $4, $5)
+          `,
+          [flo_id, a.property_id, tokenAmount, a.share, value],
+        );
+      }
+      await client.query("COMMIT");
+      rebalanced += 1;
+    } catch (err) {
+      await client.query("ROLLBACK");
+      console.error(`Failed to rebalance portfolio for ${flo_id}:`, err);
+    } finally {
+      client.release();
+    }
+  }
+
+  return { rebalanced };
+}
+
+// --- Sell execution (finishing the loop) --------------------------------------
+// This sends the released slice of each sell request and records it once.
+async function executeReleasedSells() {
+  const queued = await pool.query(
+    `SELECT id, flo_id, token_amount, released_amount, paid_amount FROM sell_queue
+     WHERE status IN ('partially_released', 'fulfilled')`,
+  );
+
+  let executed = 0;
+  for (const row of queued.rows) {
+    const newlyReleased = Number(row.released_amount) - Number(row.paid_amount);
+    if (newlyReleased <= 0) continue;
+
+    const tokenPrice = computeMainTokenPrice(
+      await computeSystemValuation(),
+      await getTotalMainTokenSupply(),
+    );
+    const usdaiAmount = newlyReleased * tokenPrice;
+
+    const claimClient = await pool.connect();
+    let payoutTxid;
+    try {
+      await claimClient.query("BEGIN");
+      const claimed = await claimClient.query(
+        `SELECT id, paid_amount, released_amount, status FROM sell_queue
+         WHERE id = $1 AND status IN ('partially_released', 'fulfilled') FOR UPDATE`,
+        [row.id],
+      );
+      if (!claimed.rows.length) {
+        await claimClient.query("ROLLBACK");
+        continue;
+      }
+
+      const lockedRow = claimed.rows[0];
+      const lockedNewlyReleased =
+        Number(lockedRow.released_amount) - Number(lockedRow.paid_amount);
+      if (lockedNewlyReleased <= 0) {
+        await claimClient.query("ROLLBACK");
+        continue;
+      }
+
+      const lockedUsdaiAmount = lockedNewlyReleased * tokenPrice;
+      const reserved = await reservePlatformLiquidity(
+        claimClient,
+        lockedUsdaiAmount,
+      );
+      if (!reserved) {
+        await claimClient.query("ROLLBACK");
+        continue;
+      }
+
+      await claimClient.query(
+        `UPDATE sell_queue SET status = 'sending' WHERE id = $1`,
+        [row.id],
+      );
+      await claimClient.query("COMMIT");
+
+      payoutTxid = await sendUsdaiPayment(row.flo_id, lockedUsdaiAmount);
+
+      // Record the txid right away, best-effort, before anything else
+      // that could fail - if the finalize step below fails, this is the
+      // difference between "the txid is stuck in a log line" and "the
+      // txid is on the row, ready for reconciliation."
+      try {
+        await pool.query(
+          `UPDATE sell_queue SET payout_txid = $1 WHERE id = $2`,
+          [payoutTxid, row.id],
+        );
+      } catch (txidErr) {
+        console.error(
+          `Sent ${lockedUsdaiAmount} USDAI (txid ${payoutTxid}) for sell_queue row ${row.id} ` +
+            "but failed to record the txid on the row:",
+          txidErr,
+        );
+      }
+    } catch (err) {
+      try {
+        await claimClient.query("ROLLBACK");
+      } catch (_) {}
+      console.error(`Sell payout failed for queue row ${row.id}:`, err);
+      continue;
+    } finally {
+      claimClient.release();
+    }
+
+    const finalClient = await pool.connect();
+    try {
+      await finalClient.query("BEGIN");
+      await finalClient.query(
+        `UPDATE sell_queue SET paid_amount = released_amount, status = 'paid' WHERE id = $1`,
+        [row.id],
+      );
+      await finalClient.query(
+        `UPDATE main_token_balances SET balance = balance - $1, updated_at = now() WHERE flo_id = $2`,
+        [newlyReleased, row.flo_id],
+      );
+      await finalClient.query(
+        `
+        INSERT INTO main_token_transactions (flo_id, type, token_amount, price_at_time, payment_txid)
+        VALUES ($1, 'sell', $2, $3, $4)
+        `,
+        [row.flo_id, newlyReleased, tokenPrice, payoutTxid],
+      );
+      await finalClient.query("COMMIT");
+      executed += 1;
+    } catch (err) {
+      await finalClient.query("ROLLBACK");
+      console.error(
+        `CRITICAL: sent ${usdaiAmount} USDAI (txid ${payoutTxid}) to ${row.flo_id} for sell_queue row ${row.id} ` +
+          "but recording it failed - needs manual reconciliation:",
+        err,
+      );
+    } finally {
+      finalClient.release();
+    }
+  }
+
+  return { executed };
 }
 
 // ---------------------------------------------------------------------
 // Ranking pipeline
 //
 // Rank populated properties, update their scores and prices,
-// release new slots when demand stays high, and maintain the Top 100.
+// maintain the Top 100.
 // Categories with independent ranking get their own Top 100;
 // the rest share the global Top 100.
 // ---------------------------------------------------------------------
@@ -994,45 +1829,46 @@ async function runMarketplacePipeline() {
         )
     `);
 
-    // 1 & 2: recompute scores/price, mint slots on sustained scarcity
+    // Recompute price from the property's consumption-driven base price, scarcity score, and utility score.
     const scored = [];
     for (const property of populated.rows) {
       const scarcity = await computeScarcityScore(property.id);
       const utility = await computeUtilityScore(property.id);
-      const price = computePrice(scarcity, utility);
 
-      const highScarcity = scarcity > SLOT_RELEASE_SCARCITY_THRESHOLD;
-      const newStreak = highScarcity
-        ? (property.high_scarcity_streak || 0) + 1
-        : 0;
+      const consumption = await computePropertyConsumption(property.id);
+      const basePrice = calculateBasePrice(consumption);
+      const price = computePrice(basePrice, scarcity, utility);
+      await recordValuation(property.id, consumption, basePrice);
 
-      let newTotalSlots = property.total_slots;
-      if (newStreak >= SLOT_RELEASE_SUSTAINED_RUNS) {
-        newTotalSlots += 1;
-        await pool.query(
-          `INSERT INTO property_slots (property_id, slot_index)
-           VALUES ($1, $2) ON CONFLICT DO NOTHING`,
-          [property.id, newTotalSlots],
-        );
-      }
+      const newStreak =
+        scarcity > 2.0 ? (property.high_scarcity_streak || 0) + 1 : 0;
 
+      // current_price is still the full scarcity/utility-adjusted price -
+      // buy/sell code downstream doesn't need to change at all. base_price
+      // is the new piece, stored separately since system_valuation (for
+      // the Main Token) sums base_price, not current_price.
       await pool.query(
         `
         UPDATE properties
         SET scarcity_score = $1,
             utility_score = $2,
-            current_price = $3,
-            total_slots = $4,
-            high_scarcity_streak = $5,
+            consumption = $3,
+            base_price = $4,
+            current_price = $5,
+            valuation_updated_at = now(),
+            total_slots = $6,
+            high_scarcity_streak = $7,
             updated_at = now()
-        WHERE id = $6
+        WHERE id = $8
         `,
         [
           scarcity,
           utility,
+          consumption,
+          basePrice,
           price,
-          newTotalSlots,
-          newStreak >= SLOT_RELEASE_SUSTAINED_RUNS ? 0 : newStreak,
+          property.total_slots,
+          newStreak,
           property.id,
         ],
       );
@@ -1040,6 +1876,8 @@ async function runMarketplacePipeline() {
       scored.push({
         id: property.id,
         category_id: property.category_id,
+        base_price: basePrice,
+        consumption,
         price,
       });
     }
@@ -1069,17 +1907,37 @@ async function runMarketplacePipeline() {
     }
 
     // Global pool: every scored property in a non-independent category.
-    await rankAndFlag(
-      scored.filter((s) => !independentCategoryIds.has(s.category_id)),
-    );
+    const globalTop100 = [...scored]
+      .filter((s) => !independentCategoryIds.has(s.category_id))
+      .sort((a, b) => b.price - a.price)
+      .slice(0, 100);
+    await rankAndFlag(globalTop100);
 
     // Independent pools: each graduated category ranks only within itself.
     for (const categoryId of independentCategoryIds) {
       await rankAndFlag(scored.filter((s) => s.category_id === categoryId));
     }
 
+    // 4: Main Token price uses the shared valuation helper.
+    const systemValuation = await computeSystemValuation();
+    const totalSupply = await getTotalMainTokenSupply();
+    const tokenPrice = computeMainTokenPrice(systemValuation, totalSupply);
+    await recordMainTokenPrice(tokenPrice, totalSupply, systemValuation);
+
+    // 5: Open sells once liquidity is high enough.
+    await releaseSellQueue();
+
+    // 6: Pay sells, then rebalance the Top 100 portfolio.
+    await executeReleasedSells();
+    await rebalancePortfolioPositions(globalTop100, tokenPrice);
+
+    // 7: Finish with contributor payouts.
+    const payoutResult = await runContributorPayoutCycle();
+
     console.log(
-      `Marketplace pipeline run complete (${scored.length} properties scored)`,
+      `Marketplace pipeline run complete (${scored.length} properties scored, ` +
+        `system_valuation=${systemValuation}, token_price=${tokenPrice}, ` +
+        `payouts: ${payoutResult.paid} paid / ${payoutResult.failed} failed)`,
     );
   } catch (err) {
     console.error("Marketplace pipeline error:", err);
@@ -1141,12 +1999,7 @@ app.post(
 );
 
 // GET /api/categories/:slug/components?component=music
-// Component-discovery only, by raw engagement (plays+likes) - this is
-// NOT the marketplace ranking. Marketplace ranking is Property-based
-// (see GET /api/categories/:slug/properties?top100=true and the ranking
-// pipeline above). This endpoint just helps an admin find which
-// lyrics/music/marketing/vocals components are worth attaching to a
-// bundle via POST /api/properties/:propertyId/components.
+// Component-discovery only, by raw engagement (plays+likes) - this is NOT the marketplace ranking. Marketplace ranking is Property-based (see GET /api/categories/:slug/properties?top100=true and the ranking pipeline above). This endpoint just helps an admin find which lyrics/music/marketing/vocals components are worth attaching to a bundle via POST /api/properties/:propertyId/components.
 app.get("/api/categories/:slug/components", async (req, res) => {
   const { slug } = req.params;
   const componentType = req.query.component;
@@ -1262,7 +2115,7 @@ app.post(
 
 // GET /api/marketplace/payment-address
 // Public - the buyer needs this to know where to send FLO before calling
-// the buy endpoint with the resulting txid.
+// the property-marketplace buy endpoint with the resulting txid.
 app.get("/api/marketplace/payment-address", (req, res) => {
   if (!MARKETPLACE_FLO_ADDRESS) {
     return res
@@ -1270,6 +2123,18 @@ app.get("/api/marketplace/payment-address", (req, res) => {
       .json({ success: false, error: "Payments not configured" });
   }
   res.json({ success: true, address: MARKETPLACE_FLO_ADDRESS });
+});
+
+// GET /api/main-token/payment-address
+// Public - the buyer needs this to know where to send USDAI before calling
+// the Main Token buy endpoint with the resulting txid.
+app.get("/api/main-token/payment-address", (req, res) => {
+  if (!USDAI_PAYMENT_ADDRESS) {
+    return res
+      .status(503)
+      .json({ success: false, error: "Payments not configured" });
+  }
+  res.json({ success: true, address: USDAI_PAYMENT_ADDRESS });
 });
 
 // ---------------------------------------------------------------------
@@ -1342,7 +2207,7 @@ app.get("/api/people/:floId", async (req, res) => {
 // ---------------------------------------------------------------------
 
 // POST /api/properties  { adminFloId, categorySlug, name, time, pubKey, sign }
-// Creates the bundle and its initial slots.
+// Creates the bundle.
 app.post(
   "/api/properties",
   verifyFloSignature(["adminFloId", "categorySlug", "name", "time"], {
@@ -1380,13 +2245,6 @@ app.post(
          RETURNING *`,
         [category.rows[0].id, name, adminFloId],
       );
-
-      for (let i = 1; i <= property.rows[0].total_slots; i++) {
-        await client.query(
-          `INSERT INTO property_slots (property_id, slot_index) VALUES ($1, $2)`,
-          [property.rows[0].id, i],
-        );
-      }
 
       await client.query("COMMIT");
       res.json({ success: true, property: property.rows[0] });
@@ -1531,11 +2389,18 @@ app.post(
     }
 
     try {
+      const pid = parsePositiveInt(propertyId);
+      const cid = parsePositiveInt(componentId);
+      if (!pid || !cid) {
+        return res
+          .status(400)
+          .json({ success: false, error: "Invalid propertyId or componentId" });
+      }
       const check = await pool.query(
         `SELECT p.category_id AS property_category_id, tc.category_id AS component_category_id
          FROM properties p, tracks_components tc
          WHERE p.id = $1 AND tc.id = $2`,
-        [propertyId, componentId],
+        [pid, cid],
       );
       if (!check.rows.length) {
         return res
@@ -1772,41 +2637,6 @@ app.post(
   },
 );
 
-// GET /api/properties/:propertyId/slots
-app.get("/api/properties/:propertyId/slots", async (req, res) => {
-  const { propertyId } = req.params;
-
-  try {
-    const result = await pool.query(
-      "SELECT * FROM property_slots WHERE property_id = $1 ORDER BY slot_index",
-      [propertyId],
-    );
-    res.json({ success: true, slots: result.rows });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ success: false, error: "Database error" });
-  }
-});
-
-// GET /api/properties/:propertyId/history
-app.get("/api/properties/:propertyId/history", async (req, res) => {
-  const { propertyId } = req.params;
-
-  try {
-    const result = await pool.query(
-      `SELECT type, price, flo_id, created_at
-       FROM property_transactions
-       WHERE property_id = $1
-       ORDER BY created_at ASC`,
-      [propertyId],
-    );
-    res.json({ success: true, history: result.rows });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ success: false, error: "Database error" });
-  }
-});
-
 // POST /api/properties/:propertyId/interest  { floId, intent, time, pubKey, sign }
 // Signed: hashcontent = [propertyId, floId, intent, time].join("|")
 app.post(
@@ -1838,332 +2668,247 @@ app.post(
   },
 );
 
-// Validates that a route param is a positive integer before it's used in
-// a query, returning a clean 400 instead of leaking a Postgres cast error
-// through as a generic 500.
-function parsePositiveInt(value) {
-  const n = parseInt(value, 10);
-  return Number.isInteger(n) && n > 0 ? n : null;
-}
+const MIN_MAIN_TOKEN_BUY_USDAI = 0.01; // dust floor, just enough to make sure a real payment happened
 
-// POST /api/properties/:propertyId/slots/:slotId/buy  { floId, floTxid, time, pubKey, sign }
-// Signed: hashcontent = [propertyId, slotId, floId, time].join("|") - see flo-auth.js.
-// Verify the payment before modifying the slot.
-// Lock the slot during the purchase so concurrent requests cannot buy the same slot.
-// The unique txid index prevents the same payment from being reused.
+// GET /api/main-token/price - current token price plus the numbers behind it
+app.get("/api/main-token/price", async (req, res) => {
+  try {
+    const systemValuation = await computeSystemValuation();
+    const totalSupply = await getTotalMainTokenSupply();
+    const tokenPrice = computeMainTokenPrice(systemValuation, totalSupply);
+    res.json({ success: true, tokenPrice, systemValuation, totalSupply });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ success: false, error: "Database error" });
+  }
+});
+
+// GET /api/main-token/portfolio/:floId - a holder's current Top-100 exposure
+app.get("/api/main-token/portfolio/:floId", async (req, res) => {
+  const { floId } = req.params;
+  try {
+    const balanceResult = await pool.query(
+      "SELECT balance FROM main_token_balances WHERE flo_id = $1",
+      [floId],
+    );
+    const positions = await pool.query(
+      `
+      SELECT pp.property_id, pp.token_amount, pp.allocation_pct, pp.value,
+             p.name AS property_name
+      FROM portfolio_positions pp
+      JOIN properties p ON p.id = pp.property_id
+      WHERE pp.flo_id = $1
+      ORDER BY pp.value DESC
+      `,
+      [floId],
+    );
+    res.json({
+      success: true,
+      balance: Number(balanceResult.rows[0]?.balance || 0),
+      positions: positions.rows,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ success: false, error: "Database error" });
+  }
+});
+
+// POST /api/main-token/buy  { floId, usdaiTxid, time, pubKey, sign }
+// USDAI buys mint Main Token and update the Top 100.
 app.post(
-  "/api/properties/:propertyId/slots/:slotId/buy",
+  "/api/main-token/buy",
   rateLimit({ max: 10, windowMs: 60000 }),
-  verifyFloSignature(["propertyId", "slotId", "floId", "time"]),
+  verifyFloSignature(["floId", "usdaiTxid", "time"]),
   async (req, res) => {
-    const propertyId = parsePositiveInt(req.params.propertyId);
-    const slotId = parsePositiveInt(req.params.slotId);
-    const { floId, floTxid } = req.body;
+    const { floId, usdaiTxid } = req.body;
 
-    if (!propertyId || !slotId) {
-      return res
-        .status(400)
-        .json({ success: false, error: "Invalid propertyId or slotId" });
-    }
     if (!floId) {
       return res.status(400).json({ success: false, error: "Missing floId" });
     }
-    if (!floTxid) {
+    if (!usdaiTxid) {
       return res.status(400).json({
         success: false,
         error:
-          "Missing floTxid - payment must be sent and confirmed before buying a slot",
+          "Missing usdaiTxid - send USDAI to the USDAI payment address first",
       });
     }
 
-    let verifiedAmount;
+    let usdaiValue;
     try {
-      const peek = await pool.query(
-        "SELECT current_price FROM properties WHERE id = $1",
-        [propertyId],
+      const payment = await verifyUsdaiPayment(
+        usdaiTxid,
+        MIN_MAIN_TOKEN_BUY_USDAI,
+        floId,
       );
-      if (!peek.rows.length) {
-        return res
-          .status(404)
-          .json({ success: false, error: "Property not found" });
-      }
-      verifiedAmount = peek.rows[0].current_price || BASE_PROPERTY_PRICE;
-      await verifyFloPayment(floTxid, verifiedAmount, floId);
+      usdaiValue = payment.tokenAmount; // 1 USDAI assumed == $1
     } catch (err) {
-      console.error("Buy payment verification failed:", err);
+      console.error("Main Token buy payment verification failed:", err);
       return res.status(402).json({
         success: false,
         error: `Payment verification failed: ${err.message || err}`,
       });
     }
 
-    const client = await pool.connect();
     try {
-      await client.query("BEGIN");
+      const systemValuation = await computeSystemValuation();
+      const totalSupply = await getTotalMainTokenSupply();
+      const tokenPrice = computeMainTokenPrice(systemValuation, totalSupply);
+      const tokenAmount = usdaiValue / tokenPrice;
+      const { expense, netAfterExpense } = splitInvestment(usdaiValue);
 
-      const slot = await client.query(
-        "SELECT * FROM property_slots WHERE id = $1 AND property_id = $2 FOR UPDATE",
-        [slotId, propertyId],
+      const top100 = await pool.query(
+        "SELECT id, consumption FROM properties WHERE in_top_100 = true",
       );
+      const allocation = computePortfolioAllocation(top100.rows);
 
-      if (!slot.rows.length) {
-        await client.query("ROLLBACK");
-        return res
-          .status(404)
-          .json({ success: false, error: "Slot not found" });
-      }
-      if (slot.rows[0].owner_flo_id) {
-        await client.query("ROLLBACK");
-        return res
-          .status(409)
-          .json({ success: false, error: "Slot already owned" });
-      }
-
-      const property = await client.query(
-        "SELECT current_price FROM properties WHERE id = $1 FOR UPDATE",
-        [propertyId],
-      );
-      const price = property.rows[0]?.current_price || BASE_PROPERTY_PRICE;
-
-      if (price > verifiedAmount) {
-        // Price moved up after payment was verified - the buyer didn't
-        // pay enough for the current price. Reject rather than under-charge.
-        await client.query("ROLLBACK");
-        return res.status(409).json({
-          success: false,
-          error:
-            "Property price increased since payment was sent - resend at the new price",
-        });
-      }
-
-      // Hold the slot for 14 days before it can be resold.
-      const holdingPeriodDays = 14;
-
-      const updated = await client.query(
-        `
-        UPDATE property_slots
-        SET owner_flo_id = $1,
-            acquired_at = now(),
-            acquired_price = $2,
-            eligible_to_sell_at = now() + ($3 || ' days')::interval
-        WHERE id = $4
-        RETURNING *
-        `,
-        [floId, price, holdingPeriodDays, slotId],
-      );
-
+      const client = await pool.connect();
       try {
+        await client.query("BEGIN");
+
         await client.query(
-          `INSERT INTO property_transactions (property_id, slot_id, type, flo_id, price, flo_txid)
-           VALUES ($1, $2, 'buy', $3, $4, $5)`,
-          [propertyId, slotId, floId, price, floTxid],
+          `
+          INSERT INTO main_token_balances (flo_id, balance)
+          VALUES ($1, $2)
+          ON CONFLICT (flo_id) DO UPDATE
+          SET balance = main_token_balances.balance + $2, updated_at = now()
+          `,
+          [floId, tokenAmount],
         );
-      } catch (err) {
-        if (err.code === "23505") {
-          // unique violation on flo_txid - this payment was already redeemed for a different slot.
-          await client.query("ROLLBACK");
-          return res.status(409).json({
-            success: false,
-            error:
-              "This payment has already been used for a different purchase",
-          });
+
+        try {
+          await client.query(
+            `
+            INSERT INTO main_token_transactions (flo_id, type, token_amount, price_at_time, payment_txid)
+            VALUES ($1, 'buy', $2, $3, $4)
+            `,
+            [floId, tokenAmount, tokenPrice, usdaiTxid],
+          );
+        } catch (err) {
+          if (err.code === "23505") {
+            await client.query("ROLLBACK");
+            return res.status(409).json({
+              success: false,
+              error: "This payment has already been redeemed for Main Token",
+            });
+          }
+          throw err;
         }
+
+        await depositToPlatformLiquidity(netAfterExpense, expense, client);
+
+        for (const a of allocation) {
+          const positionValue = usdaiValue * a.share;
+          await client.query(
+            `
+            INSERT INTO portfolio_positions (flo_id, property_id, token_amount, allocation_pct, value)
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (flo_id, property_id) DO UPDATE
+            SET token_amount = portfolio_positions.token_amount + $3,
+                allocation_pct = $4,
+                value = portfolio_positions.value + $5,
+                updated_at = now()
+            `,
+            [
+              floId,
+              a.property_id,
+              tokenAmount * a.share,
+              a.share,
+              positionValue,
+            ],
+          );
+        }
+
+        await client.query("COMMIT");
+      } catch (err) {
+        await client.query("ROLLBACK");
         throw err;
+      } finally {
+        client.release();
       }
 
-      await client.query("COMMIT");
-      res.json({ success: true, slot: updated.rows[0] });
+      res.json({
+        success: true,
+        tokenAmount,
+        tokenPrice,
+        usdaiValue,
+        platformExpense: expense,
+        liquidityPoolDeposit: netAfterExpense,
+        allocation,
+      });
     } catch (err) {
-      await client.query("ROLLBACK");
       console.error(err);
       res.status(500).json({ success: false, error: "Database error" });
-    } finally {
-      client.release();
     }
   },
 );
 
-// POST /api/properties/:propertyId/slots/:slotId/sell  { floId, time, pubKey, sign }
-// Signed the same way as buy - see flo-auth.js.
+// POST /api/main-token/sell  { floId, tokenAmount, time, pubKey, sign }
 //
-// Sell the slot and pay the owner in FLO.
-// Mark the slot as pending first to prevent duplicate sales.
-// If the payment succeeds, clear ownership and record the transaction.
-// If the server crashes after payment but before finalizing, manual
-// reconciliation may be required.
+// Just queues the sell request.
 app.post(
-  "/api/properties/:propertyId/slots/:slotId/sell",
+  "/api/main-token/sell",
   rateLimit({ max: 10, windowMs: 60000 }),
-  verifyFloSignature(["propertyId", "slotId", "floId", "time"]),
+  verifyFloSignature(["floId", "tokenAmount", "time"]),
   async (req, res) => {
-    const propertyId = parsePositiveInt(req.params.propertyId);
-    const slotId = parsePositiveInt(req.params.slotId);
     const { floId } = req.body;
+    const tokenAmount = Number(req.body.tokenAmount);
 
-    if (!propertyId || !slotId) {
-      return res
-        .status(400)
-        .json({ success: false, error: "Invalid propertyId or slotId" });
-    }
     if (!floId) {
       return res.status(400).json({ success: false, error: "Missing floId" });
     }
-
-    // Phase 1: validate ownership/eligibility, mark pending_payout, commit.
-    let price;
-    const client = await pool.connect();
-    try {
-      await client.query("BEGIN");
-
-      const slot = await client.query(
-        "SELECT * FROM property_slots WHERE id = $1 AND property_id = $2 FOR UPDATE",
-        [slotId, propertyId],
-      );
-
-      if (!slot.rows.length) {
-        await client.query("ROLLBACK");
-        return res
-          .status(404)
-          .json({ success: false, error: "Slot not found" });
-      }
-      const current = slot.rows[0];
-      if (current.owner_flo_id !== floId) {
-        await client.query("ROLLBACK");
-        return res
-          .status(403)
-          .json({ success: false, error: "Not the slot owner" });
-      }
-      if (current.pending_payout) {
-        await client.query("ROLLBACK");
-        return res.status(409).json({
-          success: false,
-          error: "A sale for this slot is already in progress",
-        });
-      }
-      if (
-        !current.eligible_to_sell_at ||
-        new Date(current.eligible_to_sell_at) > new Date()
-      ) {
-        await client.query("ROLLBACK");
-        return res.status(403).json({
-          success: false,
-          error: "Slot is not yet eligible for sale (still in holding period)",
-        });
-      }
-
-      const property = await client.query(
-        "SELECT current_price, scarcity_score FROM properties WHERE id = $1 FOR UPDATE",
-        [propertyId],
-      );
-      if ((property.rows[0]?.scarcity_score ?? 0) < 1.0) {
-        await client.query("ROLLBACK");
-        return res.status(403).json({
-          success: false,
-          error: "Insufficient buy demand to sell into right now",
-        });
-      }
-
-      price = property.rows[0].current_price || BASE_PROPERTY_PRICE;
-
-      await client.query(
-        "UPDATE property_slots SET pending_payout = true WHERE id = $1",
-        [slotId],
-      );
-
-      await client.query("COMMIT");
-    } catch (err) {
-      await client.query("ROLLBACK");
-      console.error(err);
-      return res.status(500).json({ success: false, error: "Database error" });
-    } finally {
-      client.release();
+    if (!tokenAmount || tokenAmount <= 0) {
+      return res
+        .status(400)
+        .json({ success: false, error: "Invalid tokenAmount" });
     }
 
-    // Phase 2: send the actual payout, outside the row lock (broadcasting
-    // a tx can take seconds).
-    let payoutTxid;
     try {
-      payoutTxid = await sendFloPayment(floId, price);
-    } catch (err) {
-      console.error("Payout send failed:", err);
-      await pool
-        .query(
-          "UPDATE property_slots SET pending_payout = false WHERE id = $1",
-          [slotId],
-        )
-        .catch((resetErr) =>
-          console.error(
-            `CRITICAL: failed to clear pending_payout on slot ${slotId} after a failed send - it will look permanently stuck:`,
-            resetErr,
-          ),
-        );
-      return res.status(502).json({
-        success: false,
-        error: `Payment to seller failed: ${err.message || err}`,
-      });
-    }
+      const balanceResult = await pool.query(
+        "SELECT balance FROM main_token_balances WHERE flo_id = $1",
+        [floId],
+      );
+      const balance = Number(balanceResult.rows[0]?.balance || 0);
 
-    // Phase 3: finalize - clear ownership, record the payout txid.
-    const client2 = await pool.connect();
-    try {
-      await client2.query("BEGIN");
-
-      const updated = await client2.query(
+      const outstandingResult = await pool.query(
         `
-        UPDATE property_slots
-        SET owner_flo_id = NULL,
-            acquired_at = NULL,
-            acquired_price = NULL,
-            eligible_to_sell_at = NULL,
-            pending_payout = false
-        WHERE id = $1 AND owner_flo_id = $2
+        SELECT COALESCE(SUM(token_amount - paid_amount), 0)::numeric AS outstanding
+        FROM sell_queue
+        WHERE flo_id = $1 AND status != 'fulfilled'
+        `,
+        [floId],
+      );
+      const alreadyQueued = Number(outstandingResult.rows[0]?.outstanding || 0);
+
+      if (balance - alreadyQueued < tokenAmount) {
+        return res.status(400).json({
+          success: false,
+          error: "Not enough unqueued Main Token balance to sell that amount",
+        });
+      }
+
+      const inserted = await pool.query(
+        `
+        INSERT INTO sell_queue (flo_id, token_amount)
+        VALUES ($1, $2)
         RETURNING *
         `,
-        [slotId, floId],
+        [floId, tokenAmount],
       );
 
-      if (!updated.rows.length) {
-        await client2.query("ROLLBACK");
-        console.error(
-          `CRITICAL: paid out ${price} FLO (txid ${payoutTxid}) to ${floId} for slot ${slotId} ` +
-            "but the slot no longer matched the expected owner during finalize - needs manual reconciliation",
-        );
-        return res.status(500).json({
-          success: false,
-          error:
-            "Payment was sent but finalizing the sale failed - contact support",
-          payoutTxid,
-        });
-      }
-
-      await client2.query(
-        `INSERT INTO property_transactions (property_id, slot_id, type, flo_id, price, flo_txid)
-         VALUES ($1, $2, 'sell', $3, $4, $5)`,
-        [propertyId, slotId, floId, price, payoutTxid],
-      );
-
-      await client2.query("COMMIT");
-      res.json({ success: true, slot: updated.rows[0], payoutTxid });
-    } catch (err) {
-      await client2.query("ROLLBACK");
-      console.error(
-        `CRITICAL: paid out ${price} FLO (txid ${payoutTxid}) to ${floId} for slot ${slotId} ` +
-          "but recording the sale threw - needs manual reconciliation:",
-        err,
-      );
-      res.status(500).json({
-        success: false,
-        error:
-          "Payment was sent but recording the sale failed - contact support",
-        payoutTxid,
+      const pressureRatio = await computeMainTokenPressureRatio();
+      res.json({
+        success: true,
+        queued: inserted.rows[0],
+        currentPressureRatio: pressureRatio,
+        currentReleaseFraction: computeSellReleaseFraction(pressureRatio),
       });
-    } finally {
-      client2.release();
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ success: false, error: "Database error" });
     }
   },
 );
 
-// POST /api/properties/:propertyId/usage-events - admin-only. Logging a
 // usage event directly moves utility_score (and so price), so it needs
 // to be gated to trusted admins, not just signed by any user.
 // { adminFloId, componentId, usageType, actorFloId, ..., time, pubKey, sign }
@@ -2383,7 +3128,7 @@ app.post(
 // POST /api/tasks/:taskId/claim  { creatorFloId, time, pubKey, sign }
 // Signed: hashcontent = [taskId, creatorFloId, time].join("|")
 // A creator claims an open task, committing to do the work. Row-locked
-// the same way slot buy/sell are, so two creators racing to claim the
+// the same way other row-locked actions are, so two creators racing to claim the
 // same task can't both succeed.
 app.post(
   "/api/tasks/:taskId/claim",
@@ -2525,8 +3270,7 @@ app.post(
   },
 );
 
-// Manual trigger for the pipeline job - useful for testing without
-// waiting for the daily interval. Admin-only.
+// Manually trigger the marketplace pipeline. Admin-only.
 // { adminFloId, time, pubKey, sign }
 app.post(
   "/api/marketplace/run-pipeline",

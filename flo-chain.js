@@ -54,10 +54,14 @@ async function resolveInputAddress(vin) {
   try {
     const prevTx = await floBlockchainAPI.getTx(vin.txid);
     const prevOut = prevTx && prevTx.vout && prevTx.vout[vin.vout];
-    const addrs = prevOut && prevOut.scriptPubKey && prevOut.scriptPubKey.addresses;
+    const addrs =
+      prevOut && prevOut.scriptPubKey && prevOut.scriptPubKey.addresses;
     return (addrs && addrs[0]) || null;
   } catch (err) {
-    console.error(`Could not resolve input address for prevout ${vin.txid}:${vin.vout}:`, err);
+    console.error(
+      `Could not resolve input address for prevout ${vin.txid}:${vin.vout}:`,
+      err,
+    );
     return null;
   }
 }
@@ -136,8 +140,37 @@ async function sendFloPayment(destinationFloId, amount) {
   return txid;
 }
 
+async function sendUsdaiPayment(destinationFloId, amount) {
+  if (!destinationFloId) {
+    throw new Error("Missing destination FLO address");
+  }
+
+  if (!MARKETPLACE_FLO_PRIVATE_KEY || !MARKETPLACE_FLO_ADDRESS) {
+    throw new Error("Marketplace USDAI sender is not configured");
+  }
+
+  if (!amount || Number(amount) <= 0) {
+    throw new Error("Invalid USDAI payout amount");
+  }
+
+  const tokenAmount = Number(amount).toFixed(10);
+  const floData = `send ${tokenAmount} usdai#`;
+  const sendAmt = floBlockchainAPI.sendAmt || 0.0003;
+
+  const txid = await floBlockchainAPI.sendTx(
+    MARKETPLACE_FLO_ADDRESS,
+    destinationFloId,
+    sendAmt,
+    MARKETPLACE_FLO_PRIVATE_KEY,
+    floData,
+  );
+
+  return txid;
+}
+
 module.exports = {
   verifyFloPayment,
   sendFloPayment,
+  sendUsdaiPayment,
   MARKETPLACE_FLO_ADDRESS,
 };
