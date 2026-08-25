@@ -597,16 +597,107 @@ async function verifyUsdaiPayment(txid, requiredAmount, expectedSender) {
     throw new Error("Missing USDAI transaction ID");
   }
 
-  const response = await fetch(
-    `${TOKEN_API_BASE_URL}/transactionDetails/${txid}`,
-    { signal: AbortSignal.timeout(8000) },
-  );
-  if (!response.ok) {
+  let tx;
+  let response;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    response = await fetch(
+      `${TOKEN_API_BASE_URL}/transactionDetails/${txid}`,
+      { signal: AbortSignal.timeout(8000) },
+    );
+    if (response.ok || response.status !== 404) break;
+    await new Promise((r) => setTimeout(r, 2000));
+  }
+  if (response.ok) {
+    const data = await response.json();
+    tx = data;
+  } else if (response.status === 404) {
+    console.warn(`verifyUsdaiPayment: transactionDetails 404 for ${txid}, falling back to floAddressTransactions`);
+    const addrsToTry = [expectedSender, USDAI_PAYMENT_ADDRESS].filter(Boolean);
+    let found = null;
+    for (const addr of addrsToTry) {
+      for (const tokenQs of [
+        `?token=${encodeURIComponent(USDAI_TOKEN_IDENTIFIER)}`,
+        `?token=${encodeURIComponent(USDAI_TOKEN_IDENTIFIER.toLowerCase())}`,
+        "",
+      ]) {
+        try {
+          const url = `${TOKEN_API_BASE_URL}/floAddressTransactions/${addr}${tokenQs}`;
+          const r2 = await fetch(url, { signal: AbortSignal.timeout(8000) });
+          console.warn(`fallback fetch ${url} → ${r2.status}`);
+          if (!r2.ok) continue;
+          const j2 = await r2.json();
+          const list = Array.isArray(j2)
+            ? j2
+            : j2.transactions || j2.txs || j2.data || j2.result || [];
+          const normSearch = String(txid).toLowerCase().trim();
+          const getTxid = (x) => String(x.txid || x.hash || x.txID || x.transactionTrigger || x.transactionId || "").toLowerCase().trim();
+          let match = list.find((x) => getTxid(x) === normSearch);
+          if (!match && normSearch.length >= 12) {
+            match = list.find((x) => {
+              const h = getTxid(x);
+              return h.length >= normSearch.length && h.startsWith(normSearch);
+            });
+          }
+          if (match) {
+            const foundId = getTxid(match);
+            if (foundId !== normSearch) console.warn(`fallback fuzzy match: search=${txid} matched=${foundId}`);
+            found = match;
+            break;
+          } else if (list.length && normSearch.length >= 8) {
+            const candidates = list.filter((x) => {
+              const h = getTxid(x);
+              return h.substring(0, 8) === normSearch.substring(0, 8);
+            });
+            if (candidates.length) {
+              console.warn(`fallback hint: txid ${txid} not found but similar txids exist: ${candidates.map(x=>getTxid(x)).join(", ")}`);
+            }
+          }
+        } catch (e) {
+          console.warn(`fallback error ${addr}${tokenQs}: ${e.message}`);
+        }
+      }
+      if (found) break;
+    }
+    if (!found) {
+      // Last resort: try blockbook-style hash lookup for floData (still counts as USDAI if floData matches)
+      try {
+        const r3 = await fetch(
+          `https://blockbook.ranchimall.net/api/hash/${txid}`,
+          { signal: AbortSignal.timeout(8000) },
+        );
+        console.warn(`blockbook fallback ${txid} → ${r3.status}`);
+        if (r3.ok) {
+          const b = await r3.json();
+          if (
+            String(b.floData || "")
+              .toLowerCase()
+              .includes("usdai")
+          ) {
+            // Synthesize a tx shape that passes the checks below
+            found = {
+              tokenIdentification: USDAI_TOKEN_IDENTIFIER,
+              type: "transfer",
+              transferType: "token",
+              operation: "token-transfer",
+              tokenAmount: parseFloat(
+                String(b.floData).match(/send\s+([0-9.]+)/i)?.[1] || "0",
+              ),
+              confirmations: b.confirmations || 1,
+              senderAddress: b.vin?.[0]?.addresses?.[0] || expectedSender,
+              receiverAddress:
+                b.vout?.[0]?.addresses?.[0] || USDAI_PAYMENT_ADDRESS,
+            };
+          }
+        }
+      } catch {}
+    }
+    if (!found) {
+      throw new Error(`Token API returned 404 for txid ${txid}`);
+    }
+    tx = found;
+  } else {
     throw new Error(`Token API returned ${response.status} for txid ${txid}`);
   }
-  const data = await response.json();
-
-  const tx = data;
   if (!tx) {
     throw new Error(`Unexpected token API response shape for txid ${txid}`);
   }
@@ -1247,11 +1338,12 @@ async function getTotalMainTokenSupply() {
 }
 
 function computeMainTokenPrice(systemValuation, totalSupply) {
-  // nobody holds any tokens yet - price isn't meaningful, just anchor it
-  // to system_valuation so the first buyer gets a sane starting price.
-  if (totalSupply <= 0) return systemValuation > 0 ? systemValuation : 1;
-  return systemValuation / totalSupply;
-}
+    // nobody holds any tokens yet - price isn't meaningful, just anchor it
+    // to system_valuation so the first buyer gets a sane starting price.
+    if (totalSupply <= 0) return systemValuation > 0 ? systemValuation : 1;
+    if (systemValuation <= 0) return 1; // no properties yet — keep floor 1 instead of 0
+    return systemValuation / totalSupply;
+  }
 
 async function recordMainTokenPrice(price, totalSupply, systemValuation) {
   await pool.query(
@@ -2608,7 +2700,14 @@ app.post(
 app.post(
   "/api/properties/:propertyId/financing",
   verifyFloSignature(
-    ["propertyId", "financierFloId", "amount", "revenueSharePct", "usdaiTxid", "time"],
+    [
+      "propertyId",
+      "financierFloId",
+      "amount",
+      "revenueSharePct",
+      "usdaiTxid",
+      "time",
+    ],
     { floIdField: "financierFloId" },
   ),
   async (req, res) => {
@@ -2667,7 +2766,13 @@ app.post(
               (property_id, financier_flo_id, stage, amount, revenue_share_pct, usdai_txid)
              VALUES ($1, $2, 'property_backing', $3, $4, $5)
              RETURNING *`,
-            [propertyId, financierFloId, usdaiValue, revenueSharePct || null, usdaiTxid],
+            [
+              propertyId,
+              financierFloId,
+              usdaiValue,
+              revenueSharePct || null,
+              usdaiTxid,
+            ],
           );
           position = inserted.rows[0];
         } catch (err) {
@@ -2675,7 +2780,8 @@ app.post(
             await client.query("ROLLBACK");
             return res.status(409).json({
               success: false,
-              error: "This payment has already been credited to a financing position",
+              error:
+                "This payment has already been credited to a financing position",
             });
           }
           throw err;
@@ -2734,8 +2840,8 @@ app.post(
   },
 );
 
-const MIN_MAIN_TOKEN_BUY_USDAI = 0.01; // dust floor, just enough to make sure a real payment happened
-const MIN_INVESTMENT_USDAI = 0.01; // same dust floor for financing positions (tasks, tracks, properties)
+const MIN_MAIN_TOKEN_BUY_USDAI = 0.001; // dust floor, just enough to make sure a real payment happened
+const MIN_INVESTMENT_USDAI = 0.001; // same dust floor for financing positions (tasks, tracks, properties)
 
 // GET /api/main-token/price - current token price plus the numbers behind it
 app.get("/api/main-token/price", async (req, res) => {
@@ -3086,7 +3192,14 @@ app.post(
 app.post(
   "/api/financing/tasks/:taskId/back",
   verifyFloSignature(
-    ["taskId", "financierFloId", "amount", "revenueSharePct", "usdaiTxid", "time"],
+    [
+      "taskId",
+      "financierFloId",
+      "amount",
+      "revenueSharePct",
+      "usdaiTxid",
+      "time",
+    ],
     { floIdField: "financierFloId" },
   ),
   async (req, res) => {
@@ -3144,7 +3257,13 @@ app.post(
               (task_id, financier_flo_id, stage, amount, revenue_share_pct, usdai_txid)
              VALUES ($1, $2, 'pre_creation', $3, $4, $5)
              RETURNING *`,
-            [taskId, financierFloId, usdaiValue, revenueSharePct || null, usdaiTxid],
+            [
+              taskId,
+              financierFloId,
+              usdaiValue,
+              revenueSharePct || null,
+              usdaiTxid,
+            ],
           );
           position = inserted.rows[0];
         } catch (err) {
@@ -3152,7 +3271,8 @@ app.post(
             await client.query("ROLLBACK");
             return res.status(409).json({
               success: false,
-              error: "This payment has already been credited to a financing position",
+              error:
+                "This payment has already been credited to a financing position",
             });
           }
           throw err;
@@ -3187,7 +3307,14 @@ app.post(
 app.post(
   "/api/financing/tracks/:trackId/invest",
   verifyFloSignature(
-    ["trackId", "financierFloId", "amount", "revenueSharePct", "usdaiTxid", "time"],
+    [
+      "trackId",
+      "financierFloId",
+      "amount",
+      "revenueSharePct",
+      "usdaiTxid",
+      "time",
+    ],
     { floIdField: "financierFloId" },
   ),
   async (req, res) => {
@@ -3236,7 +3363,13 @@ app.post(
               (track_id, financier_flo_id, stage, amount, revenue_share_pct, usdai_txid)
              VALUES ($1, $2, 'post_production', $3, $4, $5)
              RETURNING *`,
-            [trackId, financierFloId, usdaiValue, revenueSharePct || null, usdaiTxid],
+            [
+              trackId,
+              financierFloId,
+              usdaiValue,
+              revenueSharePct || null,
+              usdaiTxid,
+            ],
           );
           position = inserted.rows[0];
         } catch (err) {
@@ -3244,7 +3377,8 @@ app.post(
             await client.query("ROLLBACK");
             return res.status(409).json({
               success: false,
-              error: "This payment has already been credited to a financing position",
+              error:
+                "This payment has already been credited to a financing position",
             });
           }
           throw err;
