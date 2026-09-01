@@ -2,7 +2,7 @@ const express = require("express");
 const cors = require("cors");
 const { Pool } = require("pg");
 require("dotenv").config();
-const { verifyFloSignature } = require("./flo-auth");
+const { verifyFloSignature, rateLimitAuth } = require("./flo-auth");
 const {
   verifyFloPayment,
   sendFloPayment,
@@ -20,8 +20,128 @@ const app = express();
 const port = process.env.PORT || 3000;
 const sunoCache = new Map();
 const flowCache = new Map();
-const CACHE_DURATION = 5 * 60 * 1000; // 5 minutes
-const MAX_CACHE_ENTRIES = 2000; // cap cache size to avoid unbounded growth
+const top100Cache = new Map();
+const playTracking = new Map();
+const CACHE_DURATION = 5 * 60 * 1000;
+const MAX_CACHE_ENTRIES = 2000;
+
+// ==================== SCRAPER HELPERS ====================
+
+async function fetchSunoPlayCount(inputUrl) {
+  try {
+    const response = await fetch(inputUrl, {
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+      },
+      signal: AbortSignal.timeout(8000), // 8 second timeout
+    });
+    if (!response.ok) {
+      throw new Error(`Failed to fetch from Suno. Status: ${response.status}`);
+    }
+
+    const html = await response.text();
+    let playCount = null;
+
+    const playCountMatch = html.match(/play_count\\?["']?\s*:\s*(\d+)/i);
+    if (playCountMatch) {
+      playCount = parseInt(playCountMatch[1], 10);
+    } else {
+      console.warn("Could not find play_count in Suno HTML");
+    }
+
+    return playCount;
+  } catch (e) {
+    console.error("Suno scrape error:", e);
+    return null;
+  }
+}
+
+async function fetchGoogleFlowPlayCount(inputUrl) {
+  try {
+    const response = await fetch(inputUrl, {
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        Accept:
+          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      },
+      signal: AbortSignal.timeout(8000),
+    });
+
+    if (!response.ok) {
+      throw new Error(
+        `Failed to fetch Google Flow page. Status: ${response.status}`,
+      );
+    }
+
+    const html = await response.text();
+
+    const playCountMatch =
+      html.match(/"play_count"\s*:\s*(\d+)/i) ||
+      html.match(/"playCount"\s*:\s*(\d+)/i);
+
+    if (!playCountMatch) {
+      console.warn("Could not find play_count in Google Flow HTML");
+      return null;
+    }
+
+    const playCount = parseInt(playCountMatch[1], 10);
+    console.log(`Google Flow play count: ${playCount}`);
+    return playCount;
+  } catch (error) {
+    console.error("Google Flow play count error:", error);
+    return null;
+  }
+}
+
+// Pipeline lock
+let pipelineRunning = false;
+let pipelineLockTime = null;
+let pipelineStartTime = null;
+
+// Request idempotency - prevent replay attacks
+const processedRequests = new Map();
+
+function isRequestProcessed(signature, timestamp) {
+  const key = `${signature}:${timestamp}`;
+  if (processedRequests.has(key)) {
+    return true;
+  }
+  const now = Date.now();
+  for (const [k, ts] of processedRequests) {
+    if (now - ts > 5 * 60 * 1000) {
+      processedRequests.delete(k);
+    }
+  }
+  processedRequests.set(key, now);
+  return false;
+}
+
+function preventReplay(fields, floIdField = "floId") {
+  return (req, res, next) => {
+    const body = req.body || {};
+    const floId = body[floIdField];
+    const sign = body.sign;
+    const time = body.time;
+
+    if (!floId || !sign || !time) {
+      return next();
+    }
+
+    if (isRequestProcessed(sign, Number(time))) {
+      console.warn(
+        `Replay attack detected: ${floId} at ${new Date(time).toISOString()}`,
+      );
+      return res.status(409).json({
+        success: false,
+        error: "This request has already been processed",
+      });
+    }
+
+    next();
+  };
+}
 
 const cacheCleanupInterval = setInterval(() => {
   const now = Date.now();
@@ -37,19 +157,35 @@ const cacheCleanupInterval = setInterval(() => {
       flowCache.delete(key);
     }
   }
+
+  for (const [key, entry] of top100Cache.entries()) {
+    if (now - entry.timestamp > 60000) {
+      top100Cache.delete(key);
+    }
+  }
+
+  const cutoff = now - 3600000;
+  for (const [key, data] of playTracking) {
+    if (data.timestamp < cutoff) {
+      playTracking.delete(key);
+    }
+  }
+
+  for (const [key, ts] of processedRequests) {
+    if (now - ts > 5 * 60 * 1000) {
+      processedRequests.delete(key);
+    }
+  }
 }, 60 * 1000);
 
 function cacheSet(cache, key, value) {
   if (cache.size >= MAX_CACHE_ENTRIES) {
-    // evict oldest entry (Maps preserve insertion order)
     const oldestKey = cache.keys().next().value;
     cache.delete(oldestKey);
   }
   cache.set(key, value);
 }
 
-// Restrict CORS via ALLOWED_ORIGINS (comma-separated). Falls back to
-// allow-all if unset.
 const allowedOrigins = process.env.ALLOWED_ORIGINS
   ? process.env.ALLOWED_ORIGINS.split(",").map((o) => o.trim())
   : null;
@@ -73,15 +209,12 @@ app.use(express.json({ limit: "100kb" }));
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: {
-    rejectUnauthorized: false,
-  },
+  ssl: { rejectUnauthorized: false },
   max: 10,
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 10000,
 });
 
-// Log and prevent crashes on idle client errors (e.g. DB connection drops)
 pool.on("error", (err) => {
   console.error("Unexpected error on idle PostgreSQL client:", err);
 });
@@ -94,701 +227,351 @@ pool
     console.log("Connected to Neon PostgreSQL");
     client.release();
     await ensureMarketplaceSchema();
+    await ensureAuditLogSchema();
+    await ensureLifecycleSchema();
+    await ensureComponentSchema();
     dbReady = true;
   })
   .catch((err) => {
     console.error("Database connection failed:", err);
   });
 
-// Fetch with a hard timeout - external scrape targets (Suno / Flow Music)
-// can stall indefinitely, which would otherwise tie up connections forever.
-async function fetchWithTimeout(url, options = {}, timeoutMs = 8000) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    return await fetch(url, { ...options, signal: controller.signal });
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-// Helper: Scrape Suno Plays
-async function fetchSunoPlayCount(inputUrl) {
-  try {
-    const response = await fetchWithTimeout(inputUrl, {
-      headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-      },
-    });
-    if (!response.ok) {
-      throw new Error(`Failed to fetch from Suno. Status: ${response.status}`);
-    }
-
-    const html = await response.text();
-    let playCount = null;
-
-    // Extract play count using the known regex pattern
-    const playCountMatch = html.match(/play_count\\?["']?\s*:\s*(\d+)/i);
-    if (playCountMatch) {
-      playCount = parseInt(playCountMatch[1], 10);
-    } else {
-      console.warn("Could not find play_count in HTML");
-    }
-
-    return playCount;
-  } catch (e) {
-    console.error("Suno scrape error:", e);
-    return null;
-  }
-}
-
-// Helper: Scrape Google Flow Play Count
-async function fetchGoogleFlowPlayCount(inputUrl) {
-  try {
-    const response = await fetchWithTimeout(inputUrl, {
-      headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        Accept:
-          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-      },
-    });
-
-    if (!response.ok) {
-      throw new Error(
-        `Failed to fetch Google Flow page. Status: ${response.status}`,
-      );
-    }
-
-    const html = await response.text();
-
-    // Flow embeds the song data inside the page's
-    // Next.js serialized data.
-    //
-    // Try the common play_count formats used by Flow.
-    const playCountMatch =
-      html.match(/"play_count"\s*:\s*(\d+)/i) ||
-      html.match(/"playCount"\s*:\s*(\d+)/i);
-
-    if (!playCountMatch) {
-      console.warn("Could not find play_count in Google Flow HTML");
-
-      return null;
-    }
-
-    const playCount = parseInt(playCountMatch[1], 10);
-
-    console.log(`Google Flow play count: ${playCount}`);
-
-    return playCount;
-  } catch (error) {
-    console.error("Google Flow play count error:", error);
-
-    return null;
-  }
-}
-
-// Health Check Endpoint
-app.get("/health", async (req, res) => {
-  let dbOk = false;
-  try {
-    await pool.query("SELECT 1");
-    dbOk = true;
-  } catch (err) {
-    console.error("Health check DB query failed:", err);
-  }
-
-  const healthy = dbReady && dbOk;
-
-  res.status(healthy ? 200 : 503).json({
-    success: healthy,
-    status: healthy ? "ok" : "degraded",
-    db: dbOk ? "connected" : "unreachable",
-    uptime: process.uptime(),
-    timestamp: new Date().toISOString(),
-  });
-});
-
-// 1. GET /api/suno-plays
-app.get("/api/suno-plays", async (req, res) => {
-  const targetUrl = req.query.url;
-  if (!targetUrl) {
-    return res.status(400).json({
-      success: false,
-      error: "Missing url parameter",
-    });
-  }
-
-  const cached = sunoCache.get(targetUrl);
-
-  if (cached && Date.now() - cached.timestamp < CACHE_DURATION) {
-    console.log(`Serving cached Suno plays for ${targetUrl}`);
-
-    return res.json({
-      success: true,
-      playCount: cached.playCount,
-      cached: true,
-    });
-  }
-
-  console.log(`Scraping Suno URL: ${targetUrl}`);
-  const playCount = await fetchSunoPlayCount(targetUrl);
-
-  if (playCount !== null) {
-    cacheSet(sunoCache, targetUrl, {
-      playCount,
-      timestamp: Date.now(),
-    });
-
-    return res.json({
-      success: true,
-      playCount,
-      cached: false,
-    });
-  } else {
-    res.status(500).json({
-      success: false,
-      error: "Failed to extract play count",
-    });
-  }
-});
-
-// 2. GET /api/platform-plays
-app.get("/api/platform-plays", async (req, res) => {
-  const trackId = req.query.id;
-
-  if (!trackId || !trackId.trim()) {
-    return res.status(400).json({
-      success: false,
-      error: "Missing track id",
-    });
-  }
-
-  try {
-    const result = await pool.query(
-      "SELECT play_count FROM plays WHERE track_id = $1",
-      [trackId],
-    );
-
-    res.json({
-      success: true,
-      playCount: result.rows.length ? result.rows[0].play_count : 0,
-    });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({
-      success: false,
-      error: "Database error",
-    });
-  }
-});
-
-// 3. GET /api/likes
-app.get("/api/likes", async (req, res) => {
-  const trackId = req.query.id;
-  const userId = req.query.user;
-
-  if (!trackId || !userId) {
-    return res.status(400).json({
-      success: false,
-      error: "Missing track id or user id",
-    });
-  }
-
-  try {
-    const countResult = await pool.query(
-      "SELECT COUNT(*)::int AS like_count FROM likes WHERE track_id = $1",
-      [trackId],
-    );
-
-    const likedResult = await pool.query(
-      "SELECT 1 FROM likes WHERE track_id = $1 AND user_id = $2",
-      [trackId, userId],
-    );
-
-    res.json({
-      success: true,
-      likeCount: countResult.rows[0].like_count,
-      liked: likedResult.rows.length > 0,
-    });
-  } catch (err) {
-    console.error(err);
-
-    res.status(500).json({
-      success: false,
-      error: "Database error",
-    });
-  }
-});
-
-// 4. GET /api/liked-tracks
-app.get("/api/liked-tracks", async (req, res) => {
-  const userId = req.query.user;
-
-  if (!userId || !userId.trim()) {
-    return res.status(400).json({
-      success: false,
-      error: "Missing user id",
-    });
-  }
-
-  try {
-    const result = await pool.query(
-      "SELECT track_id FROM likes WHERE user_id = $1 ORDER BY track_id",
-      [userId],
-    );
-
-    res.json({
-      success: true,
-      trackIds: result.rows.map((row) => row.track_id),
-    });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({
-      success: false,
-      error: "Database error",
-    });
-  }
-});
-
-// 5. POST /api/platform-plays
-app.post("/api/platform-plays", async (req, res) => {
-  const trackId = req.query.id;
-
-  if (!trackId || !trackId.trim()) {
-    return res.status(400).json({
-      success: false,
-      error: "Missing track id",
-    });
-  }
-
-  try {
-    const result = await pool.query(
-      `
-      INSERT INTO plays (track_id, play_count)
-      VALUES ($1, 1)
-      ON CONFLICT (track_id)
-      DO UPDATE SET play_count = plays.play_count + 1
-      RETURNING play_count
-      `,
-      [trackId],
-    );
-
-    res.json({
-      success: true,
-      playCount: result.rows[0].play_count,
-    });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({
-      success: false,
-      error: "Database error",
-    });
-  }
-});
-
-// 6. POST /api/likes
-app.post("/api/likes", async (req, res) => {
-  const trackId = req.query.id;
-  const userId = req.query.user;
-
-  if (!trackId || !userId) {
-    return res.status(400).json({
-      success: false,
-      error: "Missing track id or user id",
-    });
-  }
-
-  try {
-    const existing = await pool.query(
-      "SELECT 1 FROM likes WHERE track_id = $1 AND user_id = $2",
-      [trackId, userId],
-    );
-
-    let liked;
-
-    if (existing.rows.length) {
-      await pool.query(
-        "DELETE FROM likes WHERE track_id = $1 AND user_id = $2",
-        [trackId, userId],
-      );
-      liked = false;
-    } else {
-      await pool.query(
-        "INSERT INTO likes (track_id, user_id) VALUES ($1, $2)",
-        [trackId, userId],
-      );
-      liked = true;
-    }
-
-    const countResult = await pool.query(
-      "SELECT COUNT(*)::int AS like_count FROM likes WHERE track_id = $1",
-      [trackId],
-    );
-
-    res.json({
-      success: true,
-      liked,
-      likeCount: countResult.rows[0].like_count,
-    });
-  } catch (err) {
-    console.error(err);
-
-    res.status(500).json({
-      success: false,
-      error: "Database error",
-    });
-  }
-});
-
-// 7. GET /api/user-stats
-// Aggregates total plays and total likes across a set of track ids in one
-app.get("/api/user-stats", async (req, res) => {
-  const idsParam = req.query.ids;
-
-  if (!idsParam || !idsParam.trim()) {
-    return res.status(400).json({
-      success: false,
-      error: "Missing ids parameter",
-    });
-  }
-
-  const trackIds = idsParam
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean);
-
-  if (!trackIds.length) {
-    return res.json({
-      success: true,
-      totalPlays: 0,
-      totalLikes: 0,
-    });
-  }
-
-  try {
-    const playsResult = await pool.query(
-      "SELECT COALESCE(SUM(play_count), 0)::int AS total FROM plays WHERE track_id = ANY($1)",
-      [trackIds],
-    );
-
-    const likesResult = await pool.query(
-      "SELECT COUNT(*)::int AS total FROM likes WHERE track_id = ANY($1)",
-      [trackIds],
-    );
-
-    res.json({
-      success: true,
-      totalPlays: playsResult.rows[0].total,
-      totalLikes: likesResult.rows[0].total,
-    });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({
-      success: false,
-      error: "Database error",
-    });
-  }
-});
-
-// 8. GET /api/google-flow-plays
-app.get("/api/google-flow-plays", async (req, res) => {
-  const targetUrl = req.query.url;
-
-  if (!targetUrl) {
-    return res.status(400).json({
-      success: false,
-      error: "Missing url parameter",
-    });
-  }
-
-  // Make sure this is actually a Google Flow URL
-  if (!targetUrl.includes("flowmusic.app")) {
-    return res.status(400).json({
-      success: false,
-      error: "Invalid Google Flow URL",
-    });
-  }
-
-  const cached = flowCache.get(targetUrl);
-
-  if (cached && Date.now() - cached.timestamp < CACHE_DURATION) {
-    console.log(`Serving cached Google Flow plays for ${targetUrl}`);
-
-    return res.json({
-      success: true,
-      playCount: cached.playCount,
-      cached: true,
-    });
-  }
-
-  console.log(`Fetching Google Flow plays: ${targetUrl}`);
-
-  const playCount = await fetchGoogleFlowPlayCount(targetUrl);
-
-  if (playCount !== null) {
-    cacheSet(flowCache, targetUrl, {
-      playCount,
-      timestamp: Date.now(),
-    });
-
-    return res.json({
-      success: true,
-      playCount,
-      cached: false,
-    });
-  }
-
-  return res.status(500).json({
-    success: false,
-    error: "Failed to extract Google Flow play count",
-  });
-});
-
 // =====================================================================
-// MARKETPLACE
-// Admin-curated Property bundles containing zero-or-many creative
-// components, financing positions, and people - plus scarcity/utility
-// scoring, algorithmic pricing, and the ranking pipeline.
+// DATABASE MIGRATION HELPER - Fix existing duplicate payment_txid rows
 // =====================================================================
 
-// Financing is handled separately in financing_positions.
-// It is not part of the property component ranking.
-const PROPERTY_COMPONENT_TYPES = ["lyrics", "music", "vocals", "marketing"];
-// financing is deliberately excluded here - it's never a tracks_component;
-// it only ever lives in financing_positions (see /api/properties/:id/financing
-// and the two /api/financing/* endpoints below).
-const ALL_COMPONENT_TYPES = [...PROPERTY_COMPONENT_TYPES];
+async function fixDuplicatePaymentTxids() {
+  console.log(
+    "Checking for duplicate payment_txid rows in main_token_transactions...",
+  );
 
-// Price model weights.
-const PRICE_ALPHA = 0.15;
-const PRICE_BETA = 0.15;
+  // Find duplicates
+  const duplicates = await pool.query(`
+    SELECT payment_txid, COUNT(*) as count, array_agg(id ORDER BY id ASC) as ids
+    FROM main_token_transactions
+    WHERE payment_txid IS NOT NULL
+    GROUP BY payment_txid
+    HAVING COUNT(*) > 1
+  `);
 
-// --- Main Token economy -------------------------------------------------
-// base_price is per-property, driven by consumption. Main Token,
-// liquidity, sell-gating, and payouts are a layer on top of the existing
-// scarcity/utility/price/Top 100 system.
-//
-// The numbers below are placeholders until there's real trading data to
-// tune them against.
-const PER_UNIT_VALUE = 1; // $ per consumption unit - a $1/view starting anchor, purely a placeholder
-const PLATFORM_EXPENSE_PCT = 0.05; // cut taken before anything hits liquidity
-const PLATFORM_LIQUIDITY_TARGET = 10000; // one shared pool, needed before selling OR contributor payouts open at all
-const SELL_PRESSURE_FLOOR = 1.0; // buy/sell ratio at or below this = queue stays fully closed
-const SELL_PRESSURE_CEILING = 3.0; // ratio at or above this = queue fully released
-const PORTFOLIO_FLOOR_SHARE = 0.002; // no property in the Top 100 gets less than this share of new investment
-const CONTRIBUTOR_RELEASE_PCT = 0.1; // Percentage of the shared pool released for contributor payouts each cycle
-const PER_TRACK_MIN_PAYOUT = 5; // a track's pending payout has to clear this before it actually pays out
-const CONSUMPTION_GROWTH_BURN_THRESHOLD = 0.02; // growth rate below which the future token-burn mechanism is meant to trigger - see isConsumptionGrowthFlat
-
-// --- USDAI payment verification (Main Token buy) ---------------------------
-// Main Token is priced in USDAI directly - USDAI is RanchiMall's own token on the FLO blockchain, assumed to equal $1. A USDAI transfer is verified through the token API rather than a plain FLO balance check, and both sender and receiver are checked against the live response.
-const TOKEN_API_BASE_URL =
-  process.env.TOKEN_API_BASE_URL ||
-  "https://ranchimallflo.ranchimall.net/api/v2";
-const USDAI_TOKEN_IDENTIFIER = process.env.USDAI_TOKEN_IDENTIFIER || "usdai";
-const USDAI_PAYMENT_ADDRESS = process.env.USDAI_PAYMENT_ADDRESS;
-const SENDER_FIELD_CANDIDATES = ["senderAddress"];
-const DEST_FIELD_CANDIDATES = ["receiverAddress"];
-
-async function verifyUsdaiPayment(txid, requiredAmount, expectedSender) {
-  if (!txid || typeof txid !== "string") {
-    throw new Error("Missing USDAI transaction ID");
+  if (duplicates.rows.length === 0) {
+    console.log("No duplicate payment_txid rows found.");
+    return;
   }
 
-  let tx;
-  let response;
-  for (let attempt = 0; attempt < 3; attempt++) {
-    response = await fetch(
-      `${TOKEN_API_BASE_URL}/transactionDetails/${txid}`,
-      { signal: AbortSignal.timeout(8000) },
+  console.log(`Found ${duplicates.rows.length} duplicate payment_txid values.`);
+
+  for (const row of duplicates.rows) {
+    const ids = row.ids;
+    // Keep the first one (oldest), mark others as duplicate and set payment_txid to NULL
+    const keepId = ids[0];
+    const duplicateIds = ids.slice(1);
+
+    console.log(
+      `  Payment txid ${row.payment_txid}: keeping id ${keepId}, removing ${duplicateIds.length} duplicates`,
     );
-    if (response.ok || response.status !== 404) break;
-    await new Promise((r) => setTimeout(r, 2000));
-  }
-  if (response.ok) {
-    const data = await response.json();
-    tx = data;
-  } else if (response.status === 404) {
-    console.warn(`verifyUsdaiPayment: transactionDetails 404 for ${txid}, falling back to floAddressTransactions`);
-    const addrsToTry = [expectedSender, USDAI_PAYMENT_ADDRESS].filter(Boolean);
-    let found = null;
-    for (const addr of addrsToTry) {
-      for (const tokenQs of [
-        `?token=${encodeURIComponent(USDAI_TOKEN_IDENTIFIER)}`,
-        `?token=${encodeURIComponent(USDAI_TOKEN_IDENTIFIER.toLowerCase())}`,
-        "",
-      ]) {
-        try {
-          const url = `${TOKEN_API_BASE_URL}/floAddressTransactions/${addr}${tokenQs}`;
-          const r2 = await fetch(url, { signal: AbortSignal.timeout(8000) });
-          console.warn(`fallback fetch ${url} → ${r2.status}`);
-          if (!r2.ok) continue;
-          const j2 = await r2.json();
-          const list = Array.isArray(j2)
-            ? j2
-            : j2.transactions || j2.txs || j2.data || j2.result || [];
-          const normSearch = String(txid).toLowerCase().trim();
-          const getTxid = (x) => String(x.txid || x.hash || x.txID || x.transactionTrigger || x.transactionId || "").toLowerCase().trim();
-          let match = list.find((x) => getTxid(x) === normSearch);
-          if (!match && normSearch.length >= 12) {
-            match = list.find((x) => {
-              const h = getTxid(x);
-              return h.length >= normSearch.length && h.startsWith(normSearch);
-            });
-          }
-          if (match) {
-            const foundId = getTxid(match);
-            if (foundId !== normSearch) console.warn(`fallback fuzzy match: search=${txid} matched=${foundId}`);
-            found = match;
-            break;
-          } else if (list.length && normSearch.length >= 8) {
-            const candidates = list.filter((x) => {
-              const h = getTxid(x);
-              return h.substring(0, 8) === normSearch.substring(0, 8);
-            });
-            if (candidates.length) {
-              console.warn(`fallback hint: txid ${txid} not found but similar txids exist: ${candidates.map(x=>getTxid(x)).join(", ")}`);
-            }
-          }
-        } catch (e) {
-          console.warn(`fallback error ${addr}${tokenQs}: ${e.message}`);
-        }
-      }
-      if (found) break;
-    }
-    if (!found) {
-      // Last resort: try blockbook-style hash lookup for floData (still counts as USDAI if floData matches)
-      try {
-        const r3 = await fetch(
-          `https://blockbook.ranchimall.net/api/hash/${txid}`,
-          { signal: AbortSignal.timeout(8000) },
-        );
-        console.warn(`blockbook fallback ${txid} → ${r3.status}`);
-        if (r3.ok) {
-          const b = await r3.json();
-          if (
-            String(b.floData || "")
-              .toLowerCase()
-              .includes("usdai")
-          ) {
-            // Synthesize a tx shape that passes the checks below
-            found = {
-              tokenIdentification: USDAI_TOKEN_IDENTIFIER,
-              type: "transfer",
-              transferType: "token",
-              operation: "token-transfer",
-              tokenAmount: parseFloat(
-                String(b.floData).match(/send\s+([0-9.]+)/i)?.[1] || "0",
-              ),
-              confirmations: b.confirmations || 1,
-              senderAddress: b.vin?.[0]?.addresses?.[0] || expectedSender,
-              receiverAddress:
-                b.vout?.[0]?.addresses?.[0] || USDAI_PAYMENT_ADDRESS,
-            };
-          }
-        }
-      } catch {}
-    }
-    if (!found) {
-      throw new Error(`Token API returned 404 for txid ${txid}`);
-    }
-    tx = found;
-  } else {
-    throw new Error(`Token API returned ${response.status} for txid ${txid}`);
-  }
-  if (!tx) {
-    throw new Error(`Unexpected token API response shape for txid ${txid}`);
-  }
 
-  if (
-    String(tx.tokenIdentification || "").toLowerCase() !==
-    USDAI_TOKEN_IDENTIFIER.toLowerCase()
-  ) {
-    throw new Error(
-      `Transaction ${txid} is not a ${USDAI_TOKEN_IDENTIFIER} transfer (got ${tx.tokenIdentification})`,
+    // Set payment_txid to NULL for duplicates so they don't violate the unique constraint
+    await pool.query(
+      `UPDATE main_token_transactions 
+       SET payment_txid = NULL 
+       WHERE id = ANY($1)`,
+      [duplicateIds],
     );
-  }
-  if (
-    tx.type !== "transfer" &&
-    tx.transferType !== "token" &&
-    tx.operation !== "token-transfer"
-  ) {
-    throw new Error(`Transaction ${txid} is not a token transfer`);
-  }
 
-  const tokenAmount = Number(tx.tokenAmount);
-  if (!Number.isFinite(tokenAmount) || tokenAmount < requiredAmount) {
-    throw new Error(
-      `Insufficient USDAI in transaction ${txid}: got ${tokenAmount}, required ${requiredAmount}`,
+    // Log the duplicates for audit
+    await pool.query(
+      `INSERT INTO audit_log (event_type, details, created_at)
+       VALUES ('duplicate_payment_txid_fixed', $1, NOW())`,
+      [
+        JSON.stringify({
+          payment_txid: row.payment_txid,
+          kept_id: keepId,
+          duplicate_ids: duplicateIds,
+        }),
+      ],
     );
   }
 
-  if (!tx.confirmations || tx.confirmations < 1) {
-    throw new Error(`Transaction ${txid} is not confirmed yet`);
-  }
+  console.log("Duplicate payment_txid rows fixed.");
+}
 
-  let senderField = null;
-  for (const candidate of SENDER_FIELD_CANDIDATES) {
-    if (tx[candidate]) {
-      senderField = tx[candidate];
-      break;
+// =====================================================================
+// ORPHAN PAYOUT RECONCILIATION
+// =====================================================================
+
+async function reconcileOrphanPayouts() {
+  console.log("Checking for orphan payouts (sent but not recorded)...");
+
+  // Check sell_queue for locked but unpaid rows (stuck after send)
+  const stuckSells = await pool.query(`
+    SELECT id, flo_id, token_amount, paid_amount, payout_txid, payout_locked_at
+    FROM sell_queue
+    WHERE payout_locked_at IS NOT NULL
+      AND status != 'paid'
+      AND paid_amount < token_amount
+  `);
+
+  if (stuckSells.rows.length > 0) {
+    console.log(`Found ${stuckSells.rows.length} stuck sell payouts.`);
+    for (const row of stuckSells.rows) {
+      console.log(
+        `  Sell row ${row.id}: locked at ${row.payout_locked_at}, txid ${row.payout_txid || "unknown"}`,
+      );
+      // Log for manual review
+      await pool.query(
+        `INSERT INTO audit_log (event_type, details, created_at)
+         VALUES ('stuck_sell_payout_detected', $1, NOW())`,
+        [
+          JSON.stringify({
+            queueRowId: row.id,
+            floId: row.flo_id,
+            amount: row.token_amount - row.paid_amount,
+            payoutTxid: row.payout_txid,
+            lockedAt: row.payout_locked_at,
+          }),
+        ],
+      );
     }
   }
-  if (!senderField) {
-    throw new Error(
-      `Could not find a sender address field on txid ${txid} using any of ` +
-        `[${SENDER_FIELD_CANDIDATES.join(", ")}] - refusing rather than skipping ` +
-        "the sender check. Confirm the real field name against the live API response.",
-    );
-  }
-  if (senderField !== expectedSender) {
-    throw new Error(
-      `Transaction ${txid} was sent by ${senderField}, not ${expectedSender}`,
-    );
-  }
 
-  // Make sure the payment reached the right address.
-  if (!USDAI_PAYMENT_ADDRESS) {
-    throw new Error("Payments not configured (USDAI_PAYMENT_ADDRESS unset)");
-  }
-  let destField = null;
-  for (const candidate of DEST_FIELD_CANDIDATES) {
-    if (tx[candidate]) {
-      destField = tx[candidate];
-      break;
+  // Check property_payouts for sending but not paid rows
+  const stuckPropertyPayouts = await pool.query(`
+    SELECT id, property_id, recipient_flo_id, amount, flo_txid
+    FROM property_payouts
+    WHERE status = 'sending'
+      AND paid_at IS NULL
+  `);
+
+  if (stuckPropertyPayouts.rows.length > 0) {
+    console.log(
+      `Found ${stuckPropertyPayouts.rows.length} stuck property payouts.`,
+    );
+    for (const row of stuckPropertyPayouts.rows) {
+      console.log(
+        `  Property payout ${row.id}: sending, txid ${row.flo_txid || "unknown"}`,
+      );
+      await pool.query(
+        `INSERT INTO audit_log (event_type, details, created_at)
+         VALUES ('stuck_property_payout_detected', $1, NOW())`,
+        [
+          JSON.stringify({
+            payoutId: row.id,
+            propertyId: row.property_id,
+            recipient: row.recipient_flo_id,
+            amount: row.amount,
+            txid: row.flo_txid,
+          }),
+        ],
+      );
     }
-  }
-  if (!destField) {
-    throw new Error(
-      `Could not find a destination address field on txid ${txid} using any of ` +
-        `[${DEST_FIELD_CANDIDATES.join(", ")}] - refusing rather than skipping ` +
-        "the destination check. Confirm the real field name against the live API response.",
-    );
-  }
-  if (destField !== USDAI_PAYMENT_ADDRESS) {
-    throw new Error(
-      `Transaction ${txid} was sent to ${destField}, not the USDAI payment address`,
-    );
   }
 
   return {
-    valid: true,
-    txid,
-    tokenAmount,
-    confirmations: tx.confirmations,
-    sender: senderField,
+    stuckSells: stuckSells.rows.length,
+    stuckPropertyPayouts: stuckPropertyPayouts.rows.length,
   };
 }
 
-const VALUATION_FORMULA_VERSION = "v1-per-unit-value";
+// Admin endpoint to resolve orphan payouts
+app.post(
+  "/api/admin/resolve-orphan/:type/:id",
+  secureEndpoint({
+    fields: ["adminFloId", "resolution", "time"],
+    floIdField: "adminFloId",
+    requireAdmin: true,
+    rateLimitOpts: { max: 5, windowMs: 60000 },
+  }),
+  async (req, res) => {
+    const { type, id } = req.params;
+    const { resolution } = req.body; // 'confirm_paid' or 'revert'
 
-// ---------------------------------------------------------------------
-// Schema setup
-// ---------------------------------------------------------------------
+    if (!["confirm_paid", "revert"].includes(resolution)) {
+      return res.status(400).json({
+        success: false,
+        error: "resolution must be 'confirm_paid' or 'revert'",
+      });
+    }
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+
+      if (type === "sell") {
+        const row = await client.query(
+          `SELECT * FROM sell_queue WHERE id = $1 AND payout_locked_at IS NOT NULL FOR UPDATE`,
+          [id],
+        );
+        if (!row.rows.length) {
+          await client.query("ROLLBACK");
+          return res.status(404).json({
+            success: false,
+            error: "Sell queue row not found or not locked",
+          });
+        }
+
+        if (resolution === "confirm_paid") {
+          await client.query(
+            `UPDATE sell_queue
+            SET paid_amount = released_amount,
+            status = CASE
+            WHEN released_amount >= token_amount THEN 'paid'
+            ELSE 'partially_released'
+            END,
+            payout_txid = $1
+            WHERE id = $2`,
+            [id],
+          );
+          await client.query(
+            `INSERT INTO audit_log (event_type, details, created_at)
+             VALUES ('orphan_sell_resolved_paid', $1, NOW())`,
+            [JSON.stringify({ sellId: id, resolvedBy: req.verifiedFloId })],
+          );
+        } else {
+          // Revert: unlock and refund liquidity
+          const rowData = row.rows[0];
+          const amountToRefund =
+            Number(rowData.released_amount) - Number(rowData.paid_amount);
+          const tokenPrice = await getCurrentTokenPrice();
+          const usdaiAmount = amountToRefund * tokenPrice;
+
+          await client.query(
+            `UPDATE platform_liquidity SET balance = balance + $1, updated_at = now() WHERE id = 1`,
+            [usdaiAmount],
+          );
+          await client.query(
+            `UPDATE sell_queue SET payout_locked_at = NULL WHERE id = $1`,
+            [id],
+          );
+          await client.query(
+            `INSERT INTO audit_log (event_type, details, created_at)
+             VALUES ('orphan_sell_resolved_reverted', $1, NOW())`,
+            [
+              JSON.stringify({
+                sellId: id,
+                resolvedBy: req.verifiedFloId,
+                refundedAmount: usdaiAmount,
+              }),
+            ],
+          );
+        }
+      } else if (type === "property_payout") {
+        const row = await client.query(
+          `SELECT * FROM property_payouts WHERE id = $1 AND status = 'sending' FOR UPDATE`,
+          [id],
+        );
+        if (!row.rows.length) {
+          await client.query("ROLLBACK");
+          return res.status(404).json({
+            success: false,
+            error: "Property payout not found or not in sending state",
+          });
+        }
+
+        if (resolution === "confirm_paid") {
+          await client.query(
+            `UPDATE property_payouts 
+             SET status = 'paid', paid_at = now() 
+             WHERE id = $1`,
+            [id],
+          );
+          await client.query(
+            `INSERT INTO audit_log (event_type, details, created_at)
+             VALUES ('orphan_property_payout_resolved_paid', $1, NOW())`,
+            [JSON.stringify({ payoutId: id, resolvedBy: req.verifiedFloId })],
+          );
+        } else {
+          // Revert: refund liquidity
+          const rowData = row.rows[0];
+          const usdaiAmount = Number(rowData.amount);
+
+          await client.query(
+            `UPDATE platform_liquidity SET balance = balance + $1, updated_at = now() WHERE id = 1`,
+            [usdaiAmount],
+          );
+          await client.query(
+            `UPDATE property_payouts SET status = 'pending' WHERE id = $1`,
+            [id],
+          );
+          await client.query(
+            `INSERT INTO audit_log (event_type, details, created_at)
+             VALUES ('orphan_property_payout_resolved_reverted', $1, NOW())`,
+            [
+              JSON.stringify({
+                payoutId: id,
+                resolvedBy: req.verifiedFloId,
+                refundedAmount: usdaiAmount,
+              }),
+            ],
+          );
+        }
+      } else {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          success: false,
+          error: "type must be 'sell' or 'property_payout'",
+        });
+      }
+
+      await client.query("COMMIT");
+      res.json({ success: true, message: "Orphan resolved" });
+    } catch (err) {
+      await client.query("ROLLBACK");
+      console.error("Failed to resolve orphan:", err);
+      res.status(500).json({ success: false, error: err.message });
+    } finally {
+      client.release();
+    }
+  },
+);
+
+// Admin endpoint to list orphans
+app.get(
+  "/api/admin/orphans",
+  secureEndpoint({
+    fields: ["adminFloId", "time"],
+    floIdField: "adminFloId",
+    requireAdmin: true,
+    rateLimitOpts: { max: 5, windowMs: 60000 },
+  }),
+  async (req, res) => {
+    try {
+      const [stuckSells, stuckPropertyPayouts] = await Promise.all([
+        pool.query(`
+          SELECT id, flo_id, token_amount, paid_amount, released_amount, 
+                 payout_txid, payout_locked_at, requested_at
+          FROM sell_queue
+          WHERE payout_locked_at IS NOT NULL
+            AND status != 'paid'
+            AND paid_amount < token_amount
+        `),
+        pool.query(`
+          SELECT id, property_id, recipient_flo_id, amount, flo_txid
+          FROM property_payouts
+          WHERE status = 'sending'
+            AND paid_at IS NULL
+        `),
+      ]);
+
+      res.json({
+        success: true,
+        orphans: {
+          sell_queue: stuckSells.rows,
+          property_payouts: stuckPropertyPayouts.rows,
+        },
+      });
+    } catch (err) {
+      console.error("Failed to list orphans:", err);
+      res.status(500).json({ success: false, error: err.message });
+    }
+  },
+);
+
+// =====================================================================
+// SCHEMA SETUP
+// =====================================================================
+
 async function ensureMarketplaceSchema() {
-  // plays/likes belong to the original track-library feature
   await pool.query(`
     CREATE TABLE IF NOT EXISTS plays (
       track_id    TEXT PRIMARY KEY,
@@ -812,9 +595,6 @@ async function ensureMarketplaceSchema() {
     );
   `);
 
-  // Starts false for every category: initially all categories share one
-  // global top-100 properties pool. An admin flips this once a category
-  // has enough of its own momentum to get an independent top-100 pool.
   await pool.query(`
     ALTER TABLE categories ADD COLUMN IF NOT EXISTS independent_ranking BOOLEAN DEFAULT false;
   `);
@@ -843,9 +623,6 @@ async function ensureMarketplaceSchema() {
     );
   `);
 
-  // A property is an admin-curated bundle containing components,
-  // people, and financing. Ranking fields are updated by the
-  // marketplace pipeline.
   await pool.query(`
     CREATE TABLE IF NOT EXISTS properties (
       id                SERIAL PRIMARY KEY,
@@ -860,29 +637,31 @@ async function ensureMarketplaceSchema() {
       updated_at        TIMESTAMPTZ DEFAULT now()
     );
   `);
-  await pool.query(`
-    ALTER TABLE properties ADD COLUMN IF NOT EXISTS name TEXT;
-  `);
-  await pool.query(`
-    ALTER TABLE properties ADD COLUMN IF NOT EXISTS created_by_flo_id TEXT;
-  `);
-  await pool.query(`
-    ALTER TABLE properties ADD COLUMN IF NOT EXISTS category_rank INT;
-  `);
-  await pool.query(`
-    ALTER TABLE properties ADD COLUMN IF NOT EXISTS in_top_100 BOOLEAN DEFAULT false;
-  `);
-  // consumption drives base_price now (see calculateBasePrice) - kept
-  // alongside scarcity_score/utility_score above, doesn't replace them.
-  await pool.query(`
-    ALTER TABLE properties ADD COLUMN IF NOT EXISTS consumption NUMERIC DEFAULT 0;
-  `);
-  await pool.query(`
-    ALTER TABLE properties ADD COLUMN IF NOT EXISTS base_price NUMERIC DEFAULT 0;
-  `);
-  await pool.query(`
-    ALTER TABLE properties ADD COLUMN IF NOT EXISTS valuation_updated_at TIMESTAMPTZ;
-  `);
+  await pool.query(
+    `ALTER TABLE properties ADD COLUMN IF NOT EXISTS name TEXT;`,
+  );
+  await pool.query(
+    `ALTER TABLE properties ADD COLUMN IF NOT EXISTS created_by_flo_id TEXT;`,
+  );
+  await pool.query(
+    `ALTER TABLE properties ADD COLUMN IF NOT EXISTS category_rank INT;`,
+  );
+  await pool.query(
+    `ALTER TABLE properties ADD COLUMN IF NOT EXISTS in_top_100 BOOLEAN DEFAULT false;`,
+  );
+  await pool.query(
+    `ALTER TABLE properties ADD COLUMN IF NOT EXISTS consumption NUMERIC DEFAULT 0;`,
+  );
+  await pool.query(
+    `ALTER TABLE properties ADD COLUMN IF NOT EXISTS base_price NUMERIC DEFAULT 0;`,
+  );
+  await pool.query(
+    `ALTER TABLE properties ADD COLUMN IF NOT EXISTS valuation_updated_at TIMESTAMPTZ;`,
+  );
+  await pool.query(
+    `ALTER TABLE properties ADD COLUMN IF NOT EXISTS in_global_top_100 BOOLEAN DEFAULT false;`,
+  );
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS property_valuation_history (
       id                SERIAL PRIMARY KEY,
@@ -894,8 +673,6 @@ async function ensureMarketplaceSchema() {
     );
   `);
 
-  // --- Main Token ledger ---------------------------------------------------
-  // Still just a DB ledger, not an on-chain token - that's a later phase.
   await pool.query(`
     CREATE TABLE IF NOT EXISTS main_token_balances (
       flo_id          TEXT PRIMARY KEY,
@@ -914,6 +691,24 @@ async function ensureMarketplaceSchema() {
       created_at      TIMESTAMPTZ DEFAULT now()
     );
   `);
+
+  // Fix duplicate payment_txid rows before creating unique index
+  await fixDuplicatePaymentTxids();
+
+  // Create unique index with IF NOT EXISTS
+  await pool.query(`
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_indexes 
+        WHERE indexname = 'main_token_transactions_payment_txid_unique'
+      ) THEN
+        CREATE UNIQUE INDEX main_token_transactions_payment_txid_unique
+        ON main_token_transactions (payment_txid) WHERE payment_txid IS NOT NULL;
+      END IF;
+    END $$;
+  `);
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS main_token_price_history (
       id                SERIAL PRIMARY KEY,
@@ -923,33 +718,18 @@ async function ensureMarketplaceSchema() {
       recorded_at       TIMESTAMPTZ DEFAULT now()
     );
   `);
-  // Prevent the same payment transaction from being redeemed more than once.
-  try {
-    await pool.query(`
-      CREATE UNIQUE INDEX IF NOT EXISTS main_token_transactions_payment_txid_unique
-      ON main_token_transactions (payment_txid) WHERE payment_txid IS NOT NULL;
-    `);
-  } catch (err) {
-    console.error(
-      "WARNING: could not create unique index on main_token_transactions.payment_txid " +
-        "(likely pre-existing duplicates) - txid replay protection is NOT active:",
-      err,
-    );
-  }
 
-  // --- Platform liquidity ---------------------------------------------------
-  // One platform-wide balance that has to fill up before selling opens at all - selling stays fully closed until this crosses liquidity_target.
   await pool.query(`
     CREATE TABLE IF NOT EXISTS platform_liquidity (
       id                SERIAL PRIMARY KEY,
       balance           NUMERIC DEFAULT 0,
       expenses_taken    NUMERIC DEFAULT 0,
       liquidity_target  NUMERIC,
+      last_payout_created_at TIMESTAMPTZ,
       updated_at        TIMESTAMPTZ DEFAULT now()
     );
   `);
 
-  // --- Sell-gating -----------------------------------------------------------
   await pool.query(`
     CREATE TABLE IF NOT EXISTS sell_queue (
       id              SERIAL PRIMARY KEY,
@@ -960,6 +740,15 @@ async function ensureMarketplaceSchema() {
       status          TEXT DEFAULT 'queued'
     );
   `);
+  await pool.query(
+    `ALTER TABLE sell_queue ADD COLUMN IF NOT EXISTS paid_amount NUMERIC DEFAULT 0;`,
+  );
+  await pool.query(
+    `ALTER TABLE sell_queue ADD COLUMN IF NOT EXISTS payout_txid TEXT;`,
+  );
+  await pool.query(
+    `ALTER TABLE sell_queue ADD COLUMN IF NOT EXISTS payout_locked_at TIMESTAMPTZ;`,
+  );
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS property_payouts (
@@ -972,33 +761,13 @@ async function ensureMarketplaceSchema() {
       created_at        TIMESTAMPTZ DEFAULT now()
     );
   `);
-  // status also uses 'sending' (claimed by an in-progress payout run) and
-  // 'paid' (actually sent) - see executePropertyPayouts.
-  await pool.query(`
-    ALTER TABLE property_payouts ADD COLUMN IF NOT EXISTS flo_txid TEXT;
-  `);
-  await pool.query(`
-    ALTER TABLE property_payouts ADD COLUMN IF NOT EXISTS paid_at TIMESTAMPTZ;
-  `);
+  await pool.query(
+    `ALTER TABLE property_payouts ADD COLUMN IF NOT EXISTS flo_txid TEXT;`,
+  );
+  await pool.query(
+    `ALTER TABLE property_payouts ADD COLUMN IF NOT EXISTS paid_at TIMESTAMPTZ;`,
+  );
 
-  // tracks how much of a queued sell has actually been paid out in FLO so
-  // far, separate from released_amount (which just says how much is
-  // *allowed* to be sold) - lets executeReleasedSells() pick up only the
-  // newly-unlocked slice each time it runs.
-  await pool.query(`
-    ALTER TABLE sell_queue ADD COLUMN IF NOT EXISTS paid_amount NUMERIC DEFAULT 0;
-  `);
-  // Written the moment a payout send succeeds, before any other
-  // bookkeeping - so if the rest of that bookkeeping fails, the txid
-  // still exists somewhere other than a console log.
-  await pool.query(`
-    ALTER TABLE sell_queue ADD COLUMN IF NOT EXISTS payout_txid TEXT;
-  `);
-
-  // --- User portfolio (holdings resulting from Main Token buys) -----------
-  // One row per (holder, property) they're currently exposed to through
-  // Main Token. Rebalanced on every pipeline run as Top 100 changes -
-  // see rebalancePortfolioPositions().
   await pool.query(`
     CREATE TABLE IF NOT EXISTS portfolio_positions (
       flo_id          TEXT NOT NULL,
@@ -1020,9 +789,6 @@ async function ensureMarketplaceSchema() {
     );
   `);
 
-  // Membership of a bundle: which lyrics/music/marketing/vocals
-  // components an admin has attached to it. A component can be attached
-  // to more than one property (e.g. a lyric reused across bundles).
   await pool.query(`
     CREATE TABLE IF NOT EXISTS property_components (
       property_id     INT REFERENCES properties(id),
@@ -1033,9 +799,6 @@ async function ensureMarketplaceSchema() {
     );
   `);
 
-  // People attached to a bundle. Each person has a FLO address,
-  // work profile, and optional name/CV. Role is stored as an empty
-  // string when no role is provided.
   await pool.query(`
     CREATE TABLE IF NOT EXISTS property_people (
       property_id     INT REFERENCES properties(id),
@@ -1073,8 +836,6 @@ async function ensureMarketplaceSchema() {
     );
   `);
 
-  // Minimal task board - just enough for financing_positions.task_id to
-  // reference. Full task board UI is a separate feature.
   await pool.query(`
     CREATE TABLE IF NOT EXISTS tasks (
       id                  SERIAL PRIMARY KEY,
@@ -1087,67 +848,174 @@ async function ensureMarketplaceSchema() {
       created_at          TIMESTAMPTZ DEFAULT now()
     );
   `);
-
-  await pool.query(`
-  CREATE TABLE IF NOT EXISTS property_tasks (
-    property_id INT REFERENCES properties(id),
-    task_id     INT REFERENCES tasks(id),
-    added_at    TIMESTAMPTZ DEFAULT now(),
-    PRIMARY KEY (property_id, task_id)
+  await pool.query(
+    `ALTER TABLE tasks ADD COLUMN IF NOT EXISTS component_type TEXT;`,
   );
-`);
-
-  // component_type identifies the type of creative work requested.
-  // claimed_at and completed_at track the task lifecycle.
-  await pool.query(`
-    ALTER TABLE tasks ADD COLUMN IF NOT EXISTS component_type TEXT;
-  `);
-  await pool.query(`
-    ALTER TABLE tasks ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMPTZ;
-  `);
-  await pool.query(`
-    ALTER TABLE tasks ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ;
-  `);
+  await pool.query(
+    `ALTER TABLE tasks ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMPTZ;`,
+  );
+  await pool.query(
+    `ALTER TABLE tasks ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ;`,
+  );
 
   await pool.query(`
-    CREATE TABLE IF NOT EXISTS financing_positions (
-      id                SERIAL PRIMARY KEY,
-      track_id          TEXT,
-      task_id           INT REFERENCES tasks(id),
-      financier_flo_id  TEXT NOT NULL,
-      stage             TEXT NOT NULL,
-      amount            NUMERIC NOT NULL,
-      revenue_share_pct NUMERIC,
-      status            TEXT DEFAULT 'active',
-      created_at        TIMESTAMPTZ DEFAULT now()
+    CREATE TABLE IF NOT EXISTS property_tasks (
+      property_id INT REFERENCES properties(id),
+      task_id     INT REFERENCES tasks(id),
+      added_at    TIMESTAMPTZ DEFAULT now(),
+      PRIMARY KEY (property_id, task_id)
     );
   `);
-  // Allow financing to be attached directly to a bundle property.
+
+  // FINANCE COMPONENTS
   await pool.query(`
-    ALTER TABLE financing_positions ADD COLUMN IF NOT EXISTS property_id INT REFERENCES properties(id);
+    CREATE TABLE IF NOT EXISTS finance_components (
+      id                  SERIAL PRIMARY KEY,
+      property_id         INT REFERENCES properties(id) NOT NULL,
+      component_type      TEXT NOT NULL,
+      title               TEXT NOT NULL,
+      description         TEXT,
+      amount              NUMERIC DEFAULT 0,
+      currency            TEXT DEFAULT NULL,
+      terms               TEXT,
+      created_by_flo_id   TEXT NOT NULL,
+      metadata            JSONB,
+      created_at          TIMESTAMPTZ DEFAULT now(),
+      updated_at          TIMESTAMPTZ DEFAULT now()
+    );
   `);
-  // Financing positions are funded by real USDAI payments - store the funding txid (unique when present, so a payment can't be reused).
+
   await pool.query(`
-    ALTER TABLE financing_positions ADD COLUMN IF NOT EXISTS usdai_txid TEXT;
+    CREATE TABLE IF NOT EXISTS royalty_splits (
+      id                  SERIAL PRIMARY KEY,
+      finance_component_id INT REFERENCES finance_components(id) NOT NULL,
+      recipient_flo_id    TEXT NOT NULL,
+      share_percentage    NUMERIC NOT NULL CHECK (share_percentage >= 0 AND share_percentage <= 100),
+      role                TEXT,
+      created_at          TIMESTAMPTZ DEFAULT now()
+    );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS property_finance_allocations (
+      id                  SERIAL PRIMARY KEY,
+      property_id         INT REFERENCES properties(id) NOT NULL,
+      category            TEXT NOT NULL,
+      amount              NUMERIC NOT NULL DEFAULT 0,
+      allocation_pct      NUMERIC NOT NULL,
+      description         TEXT,
+      created_at          TIMESTAMPTZ DEFAULT now(),
+      updated_at          TIMESTAMPTZ DEFAULT now()
+    );
+  `);
+
+  await pool.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_property_finance_allocations_property_category 
+    ON property_finance_allocations (property_id, category);
   `);
   await pool.query(`
-    CREATE UNIQUE INDEX IF NOT EXISTS financing_positions_usdai_txid_key
-      ON financing_positions (usdai_txid) WHERE usdai_txid IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_property_finance_allocations_property 
+    ON property_finance_allocations (property_id);
+  `);
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_property_finance_allocations_category 
+    ON property_finance_allocations (category);
   `);
 
   console.log("Marketplace v3 schema ready (bundle properties)");
 }
 
-// ---------------------------------------------------------------------
-// Scarcity / Utility / Price
-// ---------------------------------------------------------------------
+async function ensureAuditLogSchema() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS play_audit_log (
+      id SERIAL PRIMARY KEY,
+      track_id TEXT NOT NULL,
+      user_flo_id TEXT NOT NULL,
+      ip_address TEXT,
+      user_agent TEXT,
+      created_at TIMESTAMPTZ DEFAULT now()
+    );
+  `);
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_play_audit_track_user 
+    ON play_audit_log (track_id, user_flo_id, created_at);
+  `);
 
-// Minimal in-memory rate limiter (no extra dependency) for the endpoints
-// that can influence scarcity/utility scores or move ownership - these
-// are the ones worth protecting from spam even before real auth exists.
-// Not distributed-safe (per-process only) - fine for a single instance,
-// revisit if this ever runs behind multiple server processes.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS audit_log (
+      id SERIAL PRIMARY KEY,
+      event_type TEXT NOT NULL,
+      flo_id TEXT,
+      ip_address TEXT,
+      user_agent TEXT,
+      details JSONB,
+      created_at TIMESTAMPTZ DEFAULT now()
+    );
+  `);
+  await pool.query(
+    `CREATE INDEX IF NOT EXISTS idx_audit_log_flo_id ON audit_log (flo_id);`,
+  );
+  await pool.query(
+    `CREATE INDEX IF NOT EXISTS idx_audit_log_event_type ON audit_log (event_type);`,
+  );
+  await pool.query(
+    `CREATE INDEX IF NOT EXISTS idx_audit_log_created_at ON audit_log (created_at);`,
+  );
+
+  console.log("Audit log schema ready");
+}
+
+async function ensureLifecycleSchema() {
+  await pool.query(`
+    ALTER TABLE properties ADD COLUMN IF NOT EXISTS lifecycle_state 
+    TEXT DEFAULT 'incubating'
+  `);
+  await pool.query(`
+    ALTER TABLE properties ADD COLUMN IF NOT EXISTS incubation_started_at TIMESTAMPTZ
+  `);
+  await pool.query(`
+    ALTER TABLE properties ADD COLUMN IF NOT EXISTS graduated_at TIMESTAMPTZ
+  `);
+  console.log("Lifecycle schema ready");
+}
+
+async function ensureComponentSchema() {
+  await pool.query(`
+    ALTER TABLE tracks_components 
+    ADD COLUMN IF NOT EXISTS component_category TEXT
+  `);
+  console.log("Component schema ready");
+}
+
+// =====================================================================
+// HELPER FUNCTIONS
+// =====================================================================
+
+async function logAuditEvent(eventType, details) {
+  try {
+    await pool.query(
+      `INSERT INTO audit_log (
+        event_type, flo_id, ip_address, user_agent, details, created_at
+      ) VALUES ($1, $2, $3, $4, $5, NOW())`,
+      [
+        eventType,
+        details.floId || null,
+        details.ip || null,
+        details.userAgent || null,
+        JSON.stringify(details),
+      ],
+    );
+  } catch (err) {
+    console.error("Failed to log audit event:", err);
+  }
+}
+
+// =====================================================================
+// RATE LIMITING MIDDLEWARE
+// =====================================================================
+
 const rateLimitBuckets = new Map();
+
 function rateLimit({ windowMs = 60 * 1000, max = 20 } = {}) {
   return (req, res, next) => {
     const key = `${req.ip}:${req.path}`;
@@ -1173,10 +1041,6 @@ function parsePositiveInt(value) {
   return Number.isInteger(n) && n > 0 ? n : null;
 }
 
-// Admin allowlist for marketplace admin actions (creating categories,
-// logging usage events, manually triggering the pipeline). Configurable
-// via ADMIN_FLO_IDS (comma-separated) with a hardcoded default so this
-// works out of the box
 const ADMIN_FLO_IDS = (
   process.env.ADMIN_FLO_IDS || "FSLjdS5mtMzfZ3BRHMyqueshFSRxNkuJeN"
 )
@@ -1184,9 +1048,6 @@ const ADMIN_FLO_IDS = (
   .map((id) => id.trim())
   .filter(Boolean);
 
-// Must run after verifyFloSignature - it trusts req.body[floIdField]
-// because the signature middleware already proved that ID signed this
-// request. Doesn't do its own signature check.
 function requireAdmin(floIdField = "floId") {
   return (req, res, next) => {
     const floId = req.body[floIdField];
@@ -1199,7 +1060,528 @@ function requireAdmin(floIdField = "floId") {
   };
 }
 
-// trailing 7-day want_to_buy / want_to_sell ratio, clamped 0.1-10
+// =====================================================================
+// SECURE ENDPOINT WRAPPER
+// =====================================================================
+
+function secureEndpoint({
+  fields,
+  floIdField = "floId",
+  requireAdmin: requireAdminAccess = false,
+  adminFloIdField = "adminFloId",
+  rateLimitOpts = { max: 20, windowMs: 60000 },
+}) {
+  const middlewares = [
+    rateLimit(rateLimitOpts),
+    rateLimitAuth,
+    verifyFloSignature(fields, { floIdField }),
+    preventReplay(fields, floIdField),
+  ];
+
+  if (requireAdminAccess) {
+    middlewares.push(requireAdmin(adminFloIdField || floIdField));
+  }
+
+  return middlewares;
+}
+
+// =====================================================================
+// HEALTH CHECK
+// =====================================================================
+
+app.get("/api/health", async (req, res) => {
+  const checks = {
+    database: false,
+    pipeline: false,
+    liquidity: false,
+    top100: false,
+  };
+
+  try {
+    await pool.query("SELECT 1");
+    checks.database = true;
+  } catch (err) {
+    console.error("Health check DB failed:", err);
+  }
+
+  try {
+    const top100 = await getGlobalTop100();
+    checks.top100 = top100.length > 0;
+  } catch (err) {
+    console.error("Health check Top 100 failed:", err);
+  }
+
+  try {
+    const liquidity = await isPlatformLiquidityBuilt();
+    checks.liquidity = liquidity;
+  } catch (err) {
+    console.error("Health check liquidity failed:", err);
+  }
+
+  checks.pipeline = !pipelineRunning;
+
+  const healthy = Object.values(checks).every((v) => v === true);
+  const dbOk = checks.database;
+  const overallHealthy = dbReady && dbOk && healthy;
+
+  res.status(overallHealthy ? 200 : 503).json({
+    success: overallHealthy,
+    status: overallHealthy ? "ok" : "degraded",
+    checks,
+    db: dbOk ? "connected" : "unreachable",
+    uptime: process.uptime(),
+    timestamp: new Date().toISOString(),
+  });
+});
+
+// =====================================================================
+// API ENDPOINTS
+// =====================================================================
+
+app.get("/api/suno-plays", async (req, res) => {
+  const targetUrl = req.query.url;
+  if (!targetUrl) {
+    return res.status(400).json({
+      success: false,
+      error: "Missing url parameter",
+    });
+  }
+
+  const cached = sunoCache.get(targetUrl);
+  if (cached && Date.now() - cached.timestamp < CACHE_DURATION) {
+    return res.json({
+      success: true,
+      playCount: cached.playCount,
+      cached: true,
+    });
+  }
+
+  const playCount = await fetchSunoPlayCount(targetUrl);
+  if (playCount !== null) {
+    cacheSet(sunoCache, targetUrl, { playCount, timestamp: Date.now() });
+    return res.json({ success: true, playCount, cached: false });
+  } else {
+    res.status(500).json({
+      success: false,
+      error: "Failed to extract play count",
+    });
+  }
+});
+
+app.get("/api/platform-plays", async (req, res) => {
+  const trackId = req.query.id;
+  if (!trackId || !trackId.trim()) {
+    return res.status(400).json({
+      success: false,
+      error: "Missing track id",
+    });
+  }
+
+  try {
+    const result = await pool.query(
+      "SELECT play_count FROM plays WHERE track_id = $1",
+      [trackId],
+    );
+    res.json({
+      success: true,
+      playCount: result.rows.length ? result.rows[0].play_count : 0,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({
+      success: false,
+      error: "Database error",
+    });
+  }
+});
+
+// POST /api/platform-plays
+app.post("/api/platform-plays", async (req, res) => {
+  const trackId = req.query.id;
+
+  if (!trackId || !trackId.trim()) {
+    return res.status(400).json({
+      success: false,
+      error: "Missing track id",
+    });
+  }
+
+  try {
+    const result = await pool.query(
+      `
+      INSERT INTO plays (track_id, play_count)
+      VALUES ($1, 1)
+      ON CONFLICT (track_id)
+      DO UPDATE SET play_count = plays.play_count + 1
+      RETURNING play_count
+      `,
+      [trackId],
+    );
+
+    res.json({
+      success: true,
+      playCount: result.rows[0].play_count,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({
+      success: false,
+      error: "Database error",
+    });
+  }
+});
+
+app.get("/api/likes", async (req, res) => {
+  const trackId = req.query.id;
+  const userId = req.query.user;
+
+  if (!trackId || !userId) {
+    return res.status(400).json({
+      success: false,
+      error: "Missing track id or user id",
+    });
+  }
+
+  try {
+    const countResult = await pool.query(
+      "SELECT COUNT(*)::int AS like_count FROM likes WHERE track_id = $1",
+      [trackId],
+    );
+    const likedResult = await pool.query(
+      "SELECT 1 FROM likes WHERE track_id = $1 AND user_id = $2",
+      [trackId, userId],
+    );
+    res.json({
+      success: true,
+      likeCount: countResult.rows[0].like_count,
+      liked: likedResult.rows.length > 0,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({
+      success: false,
+      error: "Database error",
+    });
+  }
+});
+
+app.get("/api/liked-tracks", async (req, res) => {
+  const userId = req.query.user;
+  if (!userId || !userId.trim()) {
+    return res.status(400).json({
+      success: false,
+      error: "Missing user id",
+    });
+  }
+
+  try {
+    const result = await pool.query(
+      "SELECT track_id FROM likes WHERE user_id = $1 ORDER BY track_id",
+      [userId],
+    );
+    res.json({
+      success: true,
+      trackIds: result.rows.map((row) => row.track_id),
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({
+      success: false,
+      error: "Database error",
+    });
+  }
+});
+
+app.get("/api/user-stats", async (req, res) => {
+  const idsParam = req.query.ids;
+  if (!idsParam || !idsParam.trim()) {
+    return res.status(400).json({
+      success: false,
+      error: "Missing ids parameter",
+    });
+  }
+
+  const trackIds = idsParam
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  if (!trackIds.length) {
+    return res.json({ success: true, totalPlays: 0, totalLikes: 0 });
+  }
+
+  try {
+    const playsResult = await pool.query(
+      "SELECT COALESCE(SUM(play_count), 0)::int AS total FROM plays WHERE track_id = ANY($1)",
+      [trackIds],
+    );
+    const likesResult = await pool.query(
+      "SELECT COUNT(*)::int AS total FROM likes WHERE track_id = ANY($1)",
+      [trackIds],
+    );
+    res.json({
+      success: true,
+      totalPlays: playsResult.rows[0].total,
+      totalLikes: likesResult.rows[0].total,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({
+      success: false,
+      error: "Database error",
+    });
+  }
+});
+
+app.get("/api/google-flow-plays", async (req, res) => {
+  const targetUrl = req.query.url;
+  if (!targetUrl) {
+    return res.status(400).json({
+      success: false,
+      error: "Missing url parameter",
+    });
+  }
+
+  if (!targetUrl.includes("flowmusic.app")) {
+    return res.status(400).json({
+      success: false,
+      error: "Invalid Google Flow URL",
+    });
+  }
+
+  const cached = flowCache.get(targetUrl);
+  if (cached && Date.now() - cached.timestamp < CACHE_DURATION) {
+    return res.json({
+      success: true,
+      playCount: cached.playCount,
+      cached: true,
+    });
+  }
+
+  const playCount = await fetchGoogleFlowPlayCount(targetUrl);
+  if (playCount !== null) {
+    cacheSet(flowCache, targetUrl, { playCount, timestamp: Date.now() });
+    return res.json({ success: true, playCount, cached: false });
+  }
+
+  return res.status(500).json({
+    success: false,
+    error: "Failed to extract Google Flow play count",
+  });
+});
+
+// =====================================================================
+// MARKETPLACE - Core Constants and Helper Functions
+// =====================================================================
+
+const PROPERTY_COMPONENT_TYPES = [
+  "lyrics",
+  "music",
+  "vocals",
+  "marketing",
+  "finance",
+];
+const ALL_COMPONENT_TYPES = [...PROPERTY_COMPONENT_TYPES];
+
+const COMPONENT_CATEGORIES = {
+  CREATIVE: ["lyrics", "music", "vocals", "production"],
+  BUSINESS: ["marketing", "distribution", "legal", "finance"],
+  PEOPLE: ["artist", "producer", "engineer", "manager"],
+};
+
+const PRICE_ALPHA = 0.15;
+const PRICE_BETA = 0.15;
+
+const PER_UNIT_VALUE = 1;
+const PLATFORM_EXPENSE_PCT = 0.05;
+const PLATFORM_LIQUIDITY_TARGET = 10000;
+const SELL_PRESSURE_FLOOR = 1.0;
+const SELL_PRESSURE_CEILING = 3.0;
+
+const PORTFOLIO_FLOOR_SHARE = parseFloat(
+  process.env.PORTFOLIO_FLOOR_SHARE || "0.002",
+);
+
+const CONTRIBUTOR_RELEASE_PCT = 0.1;
+const PER_TRACK_MIN_PAYOUT = 5;
+const CONSUMPTION_GROWTH_BURN_THRESHOLD = 0.02;
+
+const TOKEN_API_BASE_URL =
+  process.env.TOKEN_API_BASE_URL ||
+  "https://ranchimallflo.ranchimall.net/api/v2";
+const USDAI_TOKEN_IDENTIFIER = process.env.USDAI_TOKEN_IDENTIFIER || "usdai";
+const USDAI_PAYMENT_ADDRESS = process.env.USDAI_PAYMENT_ADDRESS;
+const SENDER_FIELD_CANDIDATES = ["senderAddress"];
+const DEST_FIELD_CANDIDATES = ["receiverAddress"];
+
+const VALUATION_FORMULA_VERSION = "v1-per-unit-value";
+const MIN_MAIN_TOKEN_BUY_USDAI = 0.001;
+
+// =====================================================================
+// USDAI Payment Verification
+// =====================================================================
+
+async function verifyUsdaiPayment(txid, requiredAmount, expectedSender) {
+  if (!txid || typeof txid !== "string") {
+    throw new Error("Missing USDAI transaction ID");
+  }
+
+  let tx;
+  let response;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    response = await fetch(`${TOKEN_API_BASE_URL}/transactionDetails/${txid}`, {
+      signal: AbortSignal.timeout(8000),
+    });
+    if (response.ok || response.status !== 404) break;
+    await new Promise((r) => setTimeout(r, 2000));
+  }
+
+  if (response.ok) {
+    const data = await response.json();
+    tx = data;
+  } else if (response.status === 404) {
+    console.warn(
+      `verifyUsdaiPayment: transactionDetails 404 for ${txid}, falling back to floAddressTransactions`,
+    );
+    const addrsToTry = [expectedSender, USDAI_PAYMENT_ADDRESS].filter(Boolean);
+    let found = null;
+
+    for (const addr of addrsToTry) {
+      for (const tokenQs of [
+        `?token=${encodeURIComponent(USDAI_TOKEN_IDENTIFIER)}`,
+        `?token=${encodeURIComponent(USDAI_TOKEN_IDENTIFIER.toLowerCase())}`,
+        "",
+      ]) {
+        try {
+          const url = `${TOKEN_API_BASE_URL}/floAddressTransactions/${addr}${tokenQs}`;
+          const r2 = await fetch(url, { signal: AbortSignal.timeout(8000) });
+          if (!r2.ok) continue;
+          const j2 = await r2.json();
+          const list = Array.isArray(j2)
+            ? j2
+            : j2.transactions || j2.txs || j2.data || j2.result || [];
+
+          const normSearch = String(txid).toLowerCase().trim();
+          const getTxid = (x) =>
+            String(
+              x.txid ||
+                x.hash ||
+                x.txID ||
+                x.transactionTrigger ||
+                x.transactionId ||
+                "",
+            )
+              .toLowerCase()
+              .trim();
+
+          const match = list.find((x) => getTxid(x) === normSearch);
+          if (match) {
+            found = match;
+            break;
+          }
+        } catch (e) {
+          console.warn(`fallback error ${addr}${tokenQs}: ${e.message}`);
+        }
+      }
+      if (found) break;
+    }
+
+    // No Blockbook fallback - floData memo is not proof of a real token transfer
+    if (!found) {
+      throw new Error(`Token API returned 404 for txid ${txid}`);
+    }
+    tx = found;
+  } else {
+    throw new Error(`Token API returned ${response.status} for txid ${txid}`);
+  }
+
+  if (!tx) {
+    throw new Error(`Unexpected token API response shape for txid ${txid}`);
+  }
+
+  if (
+    String(tx.tokenIdentification || "").toLowerCase() !==
+    USDAI_TOKEN_IDENTIFIER.toLowerCase()
+  ) {
+    throw new Error(
+      `Transaction ${txid} is not a ${USDAI_TOKEN_IDENTIFIER} transfer (got ${tx.tokenIdentification})`,
+    );
+  }
+
+  if (
+    tx.type !== "transfer" &&
+    tx.transferType !== "token" &&
+    tx.operation !== "token-transfer"
+  ) {
+    throw new Error(`Transaction ${txid} is not a token transfer`);
+  }
+
+  const tokenAmount = Number(tx.tokenAmount);
+  if (!Number.isFinite(tokenAmount) || tokenAmount < requiredAmount) {
+    throw new Error(
+      `Insufficient USDAI in transaction ${txid}: got ${tokenAmount}, required ${requiredAmount}`,
+    );
+  }
+
+  if (!tx.confirmations || tx.confirmations < 1) {
+    throw new Error(`Transaction ${txid} is not confirmed yet`);
+  }
+
+  let senderField = null;
+  for (const candidate of SENDER_FIELD_CANDIDATES) {
+    if (tx[candidate]) {
+      senderField = tx[candidate];
+      break;
+    }
+  }
+  if (!senderField) {
+    throw new Error(
+      `Could not find a sender address field on txid ${txid} using any of ` +
+        `[${SENDER_FIELD_CANDIDATES.join(", ")}]`,
+    );
+  }
+  if (senderField !== expectedSender) {
+    throw new Error(
+      `Transaction ${txid} was sent by ${senderField}, not ${expectedSender}`,
+    );
+  }
+
+  if (!USDAI_PAYMENT_ADDRESS) {
+    throw new Error("Payments not configured (USDAI_PAYMENT_ADDRESS unset)");
+  }
+
+  let destField = null;
+  for (const candidate of DEST_FIELD_CANDIDATES) {
+    if (tx[candidate]) {
+      destField = tx[candidate];
+      break;
+    }
+  }
+  if (!destField) {
+    throw new Error(
+      `Could not find a destination address field on txid ${txid} using any of ` +
+        `[${DEST_FIELD_CANDIDATES.join(", ")}]`,
+    );
+  }
+  if (destField !== USDAI_PAYMENT_ADDRESS) {
+    throw new Error(
+      `Transaction ${txid} was sent to ${destField}, not the USDAI payment address`,
+    );
+  }
+
+  return {
+    valid: true,
+    txid,
+    tokenAmount,
+    confirmations: tx.confirmations,
+    sender: senderField,
+  };
+}
+
+// =====================================================================
+// SCARCITY / UTILITY / PRICE
+// =====================================================================
+
 async function computeScarcityScore(propertyId) {
   const result = await pool.query(
     `
@@ -1215,10 +1597,9 @@ async function computeScarcityScore(propertyId) {
 
   const { buy_count, sell_count } = result.rows[0];
   const raw = Number(buy_count) / Math.max(Number(sell_count), 1);
-  return Math.min(Math.max(raw, 0.1), 10); // clamp 0.1-10
+  return Math.min(Math.max(raw, 0.1), 10);
 }
 
-// Combine usage events with an engagement score.
 async function computeUtilityScore(propertyId) {
   const usageResult = await pool.query(
     `
@@ -1245,8 +1626,6 @@ async function computeUtilityScore(propertyId) {
     usageUtility += w * row.count;
   }
 
-  // Use total plays as a temporary engagement score.
-  // TODO: switch to 7-day play growth once plays have timestamps.
   const engagementResult = await pool.query(
     `
     WITH members AS (
@@ -1268,10 +1647,6 @@ async function computeUtilityScore(propertyId) {
   return usageUtility + engagementProxy;
 }
 
-// basePrice used to always be BASE_PROPERTY_PRICE (a flat constant).
-// Now the caller passes in the property's own consumption-driven
-// base_price instead - the scarcity/utility math around it hasn't
-// changed at all.
 function computePrice(basePrice, scarcityScore, utilityScore) {
   return (
     basePrice *
@@ -1280,37 +1655,47 @@ function computePrice(basePrice, scarcityScore, utilityScore) {
   );
 }
 
-// consumption = plays + likes across the property's component tracks -
-// same join computeUtilityScore already uses for its engagement proxy,
-// just summing raw counts instead of log-scaling them.
 async function computePropertyConsumption(propertyId) {
-  const result = await pool.query(
-    `
-    WITH members AS (
-      SELECT DISTINCT tc.track_id
-      FROM property_components pc
-      JOIN tracks_components tc ON tc.id = pc.component_id
-      WHERE pc.property_id = $1
-    ),
-    play_totals AS (
-      SELECT COALESCE(SUM(p.play_count), 0)::numeric AS total_plays
-      FROM plays p
-      JOIN members m ON m.track_id = p.track_id
-    ),
-    like_totals AS (
-      SELECT COUNT(*)::numeric AS total_likes
-      FROM likes l
-      JOIN members m ON m.track_id = l.track_id
-    )
-    SELECT play_totals.total_plays + like_totals.total_likes AS total_consumption
-    FROM play_totals, like_totals
-    `,
+  const trackResult = await pool.query(
+    `WITH members AS (
+    SELECT DISTINCT tc.track_id
+    FROM property_components pc
+    JOIN tracks_components tc ON tc.id = pc.component_id
+    WHERE pc.property_id = $1
+  )
+  SELECT 
+    COALESCE((SELECT SUM(play_count) FROM plays WHERE track_id IN (SELECT track_id FROM members)), 0)::numeric AS total_plays,
+    COALESCE((SELECT COUNT(*) FROM likes WHERE track_id IN (SELECT track_id FROM members)), 0)::numeric AS total_likes
+  `,
     [propertyId],
   );
-  return Number(result.rows[0]?.total_consumption || 0);
+
+  const trackConsumption =
+    Number(trackResult.rows[0]?.total_plays || 0) +
+    Number(trackResult.rows[0]?.total_likes || 0);
+
+  const peopleResult = await pool.query(
+    `SELECT COUNT(*)::int AS people_count FROM property_people WHERE property_id = $1`,
+    [propertyId],
+  );
+  const peopleContribution =
+    Number(peopleResult.rows[0]?.people_count || 0) * 10;
+
+  const tasksResult = await pool.query(
+    `SELECT COUNT(*)::int AS task_count FROM property_tasks WHERE property_id = $1`,
+    [propertyId],
+  );
+  const tasksContribution = Number(tasksResult.rows[0]?.task_count || 0) * 5;
+
+  const hasPeopleOrTasks = peopleContribution > 0 || tasksContribution > 0;
+  const minConsumption = hasPeopleOrTasks ? 1 : 0;
+
+  return Math.max(
+    trackConsumption + peopleContribution + tasksContribution,
+    minConsumption,
+  );
 }
 
-// Base property price is determined by consumption and the configured per-unit value.
 function calculateBasePrice(consumption) {
   return consumption * PER_UNIT_VALUE;
 }
@@ -1326,10 +1711,19 @@ async function recordValuation(propertyId, consumption, basePrice) {
   );
 }
 
-// --- Main Token price -------------------------------------------------------
-// token_price = system_valuation / total_token_supply. Whenever
-// consumption grows faster than new tokens get issued, price goes up -
-// Main Token price is based on system valuation and total token supply.
+// =====================================================================
+// MAIN TOKEN PRICE
+// =====================================================================
+
+async function computeSystemValuation() {
+  const result = await pool.query(
+    `SELECT COALESCE(SUM(base_price), 0)::numeric AS total 
+     FROM properties 
+     WHERE status = 'active' AND in_global_top_100 = true`,
+  );
+  return Number(result.rows[0]?.total || 0);
+}
+
 async function getTotalMainTokenSupply() {
   const result = await pool.query(
     `SELECT COALESCE(SUM(balance), 0)::numeric AS total FROM main_token_balances`,
@@ -1338,12 +1732,10 @@ async function getTotalMainTokenSupply() {
 }
 
 function computeMainTokenPrice(systemValuation, totalSupply) {
-    // nobody holds any tokens yet - price isn't meaningful, just anchor it
-    // to system_valuation so the first buyer gets a sane starting price.
-    if (totalSupply <= 0) return systemValuation > 0 ? systemValuation : 1;
-    if (systemValuation <= 0) return 1; // no properties yet — keep floor 1 instead of 0
-    return systemValuation / totalSupply;
-  }
+  if (totalSupply <= 0) return systemValuation > 0 ? systemValuation : 1;
+  if (systemValuation <= 0) return 1;
+  return systemValuation / totalSupply;
+}
 
 async function recordMainTokenPrice(price, totalSupply, systemValuation) {
   await pool.query(
@@ -1355,15 +1747,55 @@ async function recordMainTokenPrice(price, totalSupply, systemValuation) {
   );
 }
 
-// Not called anywhere yet - the design calls for burning tokens once consumption growth flattens out, to keep token price growing after the consumption-driven half of the valuation plateaus. This is the detection check for that; the actual burn logic doesn't exist yet.
+async function getCurrentTokenPrice() {
+  const systemValuation = await computeSystemValuation();
+  const totalSupply = await getTotalMainTokenSupply();
+  return computeMainTokenPrice(systemValuation, totalSupply);
+}
+
 function isConsumptionGrowthFlat(previousValuation, currentValuation) {
   if (!previousValuation) return false;
   const growthRate = (currentValuation - previousValuation) / previousValuation;
   return growthRate < CONSUMPTION_GROWTH_BURN_THRESHOLD;
 }
 
-// --- Platform liquidity -----------------------------------------------------
-// One shared pool backs seller and contributor payouts.
+// =====================================================================
+// Authoritative Global Top 100
+// =====================================================================
+
+async function getGlobalTop100() {
+  const result = await pool.query(`
+    SELECT id, name, consumption, base_price, current_price,
+           category_id, category_rank, in_top_100, in_global_top_100
+    FROM properties
+    WHERE status = 'active' AND in_global_top_100 = true
+    ORDER BY 
+      CASE 
+        WHEN category_rank IS NOT NULL THEN category_rank 
+        ELSE 999 
+      END ASC,
+      current_price DESC
+    LIMIT 100
+  `);
+  return result.rows;
+}
+
+async function getTop100Properties() {
+  const cacheKey = "top100_cache";
+  const cached = top100Cache.get(cacheKey);
+  if (cached && Date.now() - cached.timestamp < 60000) {
+    return cached.data;
+  }
+
+  const data = await getGlobalTop100();
+  top100Cache.set(cacheKey, { data, timestamp: Date.now() });
+  return data;
+}
+
+// =====================================================================
+// PLATFORM LIQUIDITY
+// =====================================================================
+
 function splitInvestment(grossAmount) {
   const expense = grossAmount * PLATFORM_EXPENSE_PCT;
   const netAfterExpense = grossAmount - expense;
@@ -1416,9 +1848,10 @@ async function isPlatformLiquidityBuilt() {
   );
 }
 
-// --- Sell-gating -------------------------------------------------------------
-// Same buy/sell-intent idea as computeScarcityScore, just at the Main
-// Token level instead of per property.
+// =====================================================================
+// SELL-GATING
+// =====================================================================
+
 async function computeMainTokenPressureRatio() {
   const buyResult = await pool.query(
     `
@@ -1429,7 +1862,7 @@ async function computeMainTokenPressureRatio() {
   );
   const sellResult = await pool.query(
     `
-    SELECT COALESCE(SUM(token_amount), 0)::numeric AS total
+    SELECT COALESCE(SUM(token_amount - paid_amount), 0)::numeric AS total
     FROM sell_queue
     WHERE requested_at > now() - INTERVAL '7 days'
     `,
@@ -1439,62 +1872,71 @@ async function computeMainTokenPressureRatio() {
   return buyVolume / Math.max(sellVolume, 1);
 }
 
-// 0 below SELL_PRESSURE_FLOOR, scaling straight up to 1 at
-// SELL_PRESSURE_CEILING - kept linear for now, exact curve shape TBD.
 function computeSellReleaseFraction(pressureRatio) {
   const span = SELL_PRESSURE_CEILING - SELL_PRESSURE_FLOOR;
   const raw = (pressureRatio - SELL_PRESSURE_FLOOR) / span;
   return Math.min(Math.max(raw, 0), 1);
 }
 
-// Releases the oldest queued requests first, in proportion to
-// releaseFraction. This only marks how much of each request is allowed
-// to settle; executeReleasedSells() performs the actual payout.
 async function releaseSellQueue() {
   const liquidityBuilt = await isPlatformLiquidityBuilt();
   if (!liquidityBuilt) return { releaseFraction: 0, updated: 0 };
 
+  const poolResult = await pool.query(
+    `SELECT balance FROM platform_liquidity WHERE id = 1`,
+  );
+  const poolBalance = Number(poolResult.rows[0]?.balance || 0);
+  const safeBudget = poolBalance * 0.8;
+
+  const tokenPrice = await getCurrentTokenPrice();
+
+  const queuedResult = await pool.query(
+    `SELECT COALESCE(SUM((token_amount - paid_amount) * $1), 0)::numeric AS total_value
+     FROM sell_queue
+     WHERE status IN ('queued', 'partially_released')`,
+    [tokenPrice],
+  );
+  const totalQueuedValue = Number(queuedResult.rows[0]?.total_value || 0);
+
+  if (totalQueuedValue <= 0) return { releaseFraction: 0, updated: 0 };
+
   const pressureRatio = await computeMainTokenPressureRatio();
-  const releaseFraction = computeSellReleaseFraction(pressureRatio);
+  const pressureRelease = computeSellReleaseFraction(pressureRatio);
+  const budgetRelease = safeBudget / totalQueuedValue;
+  const releaseFraction = Math.min(pressureRelease, budgetRelease);
 
   const queued = await pool.query(
-    `
-    SELECT id, token_amount, released_amount FROM sell_queue
-    WHERE status IN ('queued', 'partially_released')
-    ORDER BY requested_at ASC
-    `,
+    `SELECT id, token_amount, paid_amount, released_amount FROM sell_queue
+     WHERE status IN ('queued', 'partially_released')
+     ORDER BY requested_at ASC`,
   );
 
   let updated = 0;
   for (const row of queued.rows) {
-    const targetReleased = Number(row.token_amount) * releaseFraction;
-    if (targetReleased <= Number(row.released_amount)) continue;
+    const currentReleased = Number(row.released_amount || 0);
+    const remainingUnreleased = Number(row.token_amount) - currentReleased;
+    const additionalRelease = remainingUnreleased * releaseFraction;
+    const targetReleased = currentReleased + additionalRelease;
+    if (targetReleased <= currentReleased) continue;
 
     const fulfilled = targetReleased >= Number(row.token_amount);
     await pool.query(
-      `
-      UPDATE sell_queue
-      SET released_amount = $1,
-          status = $2
-      WHERE id = $3
-      `,
-      [
-        fulfilled ? row.token_amount : targetReleased,
-        fulfilled ? "fulfilled" : "partially_released",
-        row.id,
-      ],
+      `UPDATE sell_queue
+       SET released_amount = $1,
+           status = $2
+       WHERE id = $3`,
+      [targetReleased, fulfilled ? "fulfilled" : "partially_released", row.id],
     );
     updated += 1;
   }
 
-  return { releaseFraction, updated };
+  return { releaseFraction, updated, totalQueuedValue, safeBudget, tokenPrice };
 }
 
-// --- Portfolio allocation across the Top 100 --------------------------------
-// Buying Main Token buys a slice of the whole Top-100 portfolio, weighted
-// by each property's consumption, with a floor so nobody in the Top 100
-// ever gets zero. The contributor payout cycle below reuses this too -
-// same rule, same floor, in both places.
+// =====================================================================
+// Portfolio allocation with configurable floor
+// =====================================================================
+
 function computePortfolioAllocation(top100Properties) {
   const totalConsumption = top100Properties.reduce(
     (sum, p) => sum + Number(p.consumption || 0),
@@ -1502,15 +1944,18 @@ function computePortfolioAllocation(top100Properties) {
   );
   if (totalConsumption <= 0 || top100Properties.length === 0) return [];
 
-  const rawShares = top100Properties.map((p) => ({
-    property_id: p.id,
-    share: Math.max(
-      Number(p.consumption || 0) / totalConsumption,
-      PORTFOLIO_FLOOR_SHARE,
-    ),
-  }));
+  const rawShares = top100Properties.map((p) => {
+    const consumptionShare = Number(p.consumption || 0) / totalConsumption;
+    const share =
+      PORTFOLIO_FLOOR_SHARE > 0
+        ? Math.max(consumptionShare, PORTFOLIO_FLOOR_SHARE)
+        : consumptionShare;
+    return {
+      property_id: p.id,
+      share: share,
+    };
+  });
 
-  // floors push the total above 1 - renormalize so shares actually sum to 1
   const total = rawShares.reduce((sum, s) => sum + s.share, 0);
   return rawShares.map((s) => ({
     property_id: s.property_id,
@@ -1518,81 +1963,132 @@ function computePortfolioAllocation(top100Properties) {
   }));
 }
 
-// --- Contributor payouts -----------------------------------------------------
-// Draws from the same shared pool and liquidity_target that gates Main
-// Token selling. Each cycle releases a slice, splits it across the
-// current Top 100 by consumption, then splits each property's share
-// across its components by their own consumption. Fraud/fairness
-// adjustment is not yet implemented.
+// =====================================================================
+// CONTRIBUTOR PAYOUTS
+// =====================================================================
+
 async function releaseContributorPayouts() {
-  const liquidityBuilt = await isPlatformLiquidityBuilt();
-  if (!liquidityBuilt)
-    return { released: false, reason: "still building liquidity" };
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
 
-  const poolResult = await pool.query(
-    `SELECT balance FROM platform_liquidity WHERE id = 1`,
-  );
-  const poolBalance = Number(poolResult.rows[0]?.balance || 0);
-  const releaseAmount = poolBalance * CONTRIBUTOR_RELEASE_PCT;
-  if (releaseAmount <= 0)
-    return { released: false, reason: "nothing to release" };
-
-  const top100 = await pool.query(
-    "SELECT id, consumption FROM properties WHERE in_top_100 = true",
-  );
-  const allocation = computePortfolioAllocation(top100.rows);
-
-  let totalCreated = 0;
-  for (const a of allocation) {
-    const propertyReleaseAmount = releaseAmount * a.share;
-
-    // Same consumption metric used everywhere else: plays + likes, not
-    // plays alone.
-    const componentsResult = await pool.query(
-      `
-      SELECT tc.id AS component_id, tc.contributor_flo_id,
-             COALESCE(play_totals.total_plays, 0) + COALESCE(like_totals.total_likes, 0) AS consumption
-      FROM property_components pc
-      JOIN tracks_components tc ON tc.id = pc.component_id
-      LEFT JOIN (
-        SELECT track_id, SUM(play_count)::numeric AS total_plays FROM plays GROUP BY track_id
-      ) play_totals ON play_totals.track_id = tc.track_id
-      LEFT JOIN (
-        SELECT track_id, COUNT(*)::numeric AS total_likes FROM likes GROUP BY track_id
-      ) like_totals ON like_totals.track_id = tc.track_id
-      WHERE pc.property_id = $1
-      `,
-      [a.property_id],
+    // Lock the platform_liquidity row so only one instance can proceed
+    const row = await client.query(
+      `SELECT balance, last_payout_created_at
+       FROM platform_liquidity
+       WHERE id = 1
+       FOR UPDATE`,
     );
 
-    const totalComponentConsumption = componentsResult.rows.reduce(
-      (sum, r) => sum + Number(r.consumption),
-      0,
-    );
-    if (totalComponentConsumption <= 0) continue;
-
-    for (const row of componentsResult.rows) {
-      // TODO: real fraud/fairness signal not built yet
-      const share = Number(row.consumption) / totalComponentConsumption;
-      const amount = propertyReleaseAmount * share;
-      if (amount < PER_TRACK_MIN_PAYOUT) continue; // held back, doesn't pay out this round
-
-      await pool.query(
-        `
-        INSERT INTO property_payouts (property_id, component_id, recipient_flo_id, amount, status)
-        VALUES ($1, $2, $3, $4, 'pending')
-        `,
-        [a.property_id, row.component_id, row.contributor_flo_id, amount],
-      );
-      totalCreated += amount;
+    if (!row.rows.length) {
+      await client.query("ROLLBACK");
+      return { released: false, reason: "platform_liquidity row not found" };
     }
+
+    const poolBalance = Number(row.rows[0].balance || 0);
+    const lastPayout = row.rows[0].last_payout_created_at;
+
+    // Check liquidity is built
+    const liquidityTarget = Number(PLATFORM_LIQUIDITY_TARGET);
+    if (poolBalance < liquidityTarget) {
+      await client.query("ROLLBACK");
+      return {
+        released: false,
+        reason: `still building liquidity (${poolBalance} < ${liquidityTarget})`,
+      };
+    }
+
+    // Check cooldown (24 hours)
+    if (lastPayout) {
+      const hoursSinceLastPayout =
+        (Date.now() - new Date(lastPayout).getTime()) / (1000 * 60 * 60);
+      if (hoursSinceLastPayout < 24) {
+        await client.query("ROLLBACK");
+        return {
+          released: false,
+          reason: `payouts already created ${Math.floor(hoursSinceLastPayout)} hours ago (cooldown: 24h)`,
+        };
+      }
+    }
+
+    // Calculate release amount
+    const releaseAmount = poolBalance * CONTRIBUTOR_RELEASE_PCT;
+    if (releaseAmount <= 0) {
+      await client.query("ROLLBACK");
+      return { released: false, reason: "nothing to release" };
+    }
+
+    //Get Top 100 and allocate
+    const top100 = await getGlobalTop100();
+    const allocation = computePortfolioAllocation(top100);
+
+    let totalCreated = 0;
+    for (const a of allocation) {
+      const propertyReleaseAmount = releaseAmount * a.share;
+
+      const componentsResult = await client.query(
+        `
+        SELECT tc.id AS component_id, tc.contributor_flo_id,
+               COALESCE(play_totals.total_plays, 0) + COALESCE(like_totals.total_likes, 0) AS consumption
+        FROM property_components pc
+        JOIN tracks_components tc ON tc.id = pc.component_id
+        LEFT JOIN (
+          SELECT track_id, SUM(play_count)::numeric AS total_plays FROM plays GROUP BY track_id
+        ) play_totals ON play_totals.track_id = tc.track_id
+        LEFT JOIN (
+          SELECT track_id, COUNT(*)::numeric AS total_likes FROM likes GROUP BY track_id
+        ) like_totals ON like_totals.track_id = tc.track_id
+        WHERE pc.property_id = $1
+        `,
+        [a.property_id],
+      );
+
+      const totalComponentConsumption = componentsResult.rows.reduce(
+        (sum, r) => sum + Number(r.consumption),
+        0,
+      );
+      if (totalComponentConsumption <= 0) continue;
+
+      for (const row of componentsResult.rows) {
+        const share = Number(row.consumption) / totalComponentConsumption;
+        const amount = propertyReleaseAmount * share;
+        if (amount < PER_TRACK_MIN_PAYOUT) continue;
+
+        await client.query(
+          `
+          INSERT INTO property_payouts (property_id, component_id, recipient_flo_id, amount, status)
+          VALUES ($1, $2, $3, $4, 'pending')
+          `,
+          [a.property_id, row.component_id, row.contributor_flo_id, amount],
+        );
+        totalCreated += amount;
+      }
+    }
+
+    // Record the payout creation timestamp inside the same transaction
+    await client.query(
+      `UPDATE platform_liquidity SET last_payout_created_at = now() WHERE id = 1`,
+    );
+
+    await client.query("COMMIT");
+
+    console.log(
+      `Contributor payouts created: ${totalCreated} USDAI across ${allocation.length} properties`,
+    );
+
+    return { released: true, created: totalCreated };
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("releaseContributorPayouts error:", err);
+    return { released: false, reason: err.message };
+  } finally {
+    client.release();
   }
-
-  // These are still pending, so the pool isn't touched yet.
-  return { released: true, created: totalCreated };
 }
+// =====================================================================
+// Property payouts - reserve FIRST, then send
+// =====================================================================
 
-// Claims each payout, reserves the pool balance, then sends USDAI.
 async function executePropertyPayouts() {
   const pendingResult = await pool.query(
     `SELECT id FROM property_payouts WHERE status = 'pending'`,
@@ -1611,15 +2107,19 @@ async function executePropertyPayouts() {
         [id],
       );
       if (!claimed.rows.length) {
-        // Another run claimed it first.
         await client.query("ROLLBACK");
         continue;
       }
       payout = claimed.rows[0];
-      const amount = Number(payout.amount);
-      const reserved = await reservePlatformLiquidity(client, amount);
+      const usdaiAmount = Number(payout.amount);
+
+      const reserved = await reservePlatformLiquidity(client, usdaiAmount);
       if (!reserved) {
         await client.query("ROLLBACK");
+        console.error(
+          `Property payout ${id}: insufficient liquidity, leaving pending`,
+        );
+        failed += 1;
         continue;
       }
       await client.query(
@@ -1636,112 +2136,206 @@ async function executePropertyPayouts() {
       client.release();
     }
 
-    // Send USDAI directly.
     const usdaiAmount = Number(payout.amount);
 
     let payoutTxid;
     try {
       payoutTxid = await sendUsdaiPayment(payout.recipient_flo_id, usdaiAmount);
-    } catch (err) {
+    } catch (sendErr) {
       console.error(
-        `Property payout ${id} failed to send, reverting to pending:`,
-        err,
+        `Property payout ${id} send failed, refunding liquidity and reverting to pending:`,
+        sendErr,
       );
-      const refundClient = await pool.connect();
-      try {
-        await refundClient.query("BEGIN");
-        await refundClient.query(
-          `UPDATE property_payouts SET status = 'pending' WHERE id = $1`,
-          [id],
-        );
-        await refundClient.query(
-          `UPDATE platform_liquidity SET balance = balance + $1, updated_at = now() WHERE id = 1`,
-          [Number(payout.amount)],
-        );
-        await refundClient.query("COMMIT");
-      } catch (refundErr) {
-        await refundClient.query("ROLLBACK");
-        console.error(
-          `CRITICAL: failed to refund liquidity for property payout ${id}:`,
-          refundErr,
-        );
-      } finally {
-        refundClient.release();
-      }
+      await pool.query(
+        `UPDATE platform_liquidity SET balance = balance + $1, updated_at = now() WHERE id = 1`,
+        [usdaiAmount],
+      );
+      await pool.query(
+        `UPDATE property_payouts SET status = 'pending' WHERE id = $1`,
+        [id],
+      );
       failed += 1;
       continue;
     }
 
-    // Record the txid right away, best-effort, before anything else that
-    // could fail - if the finalize step below fails, this is the
-    // difference between "the txid is stuck in a log line" and "the
-    // txid is on the row, ready for reconciliation."
     try {
       await pool.query(
-        `UPDATE property_payouts SET flo_txid = $1 WHERE id = $2`,
-        [payoutTxid, id],
-      );
-    } catch (txidErr) {
-      console.error(
-        `Sent ${usdaiAmount} USDAI (txid ${payoutTxid}) for property payout ${id} ` +
-          "but failed to record the txid on the row:",
-        txidErr,
-      );
-    }
-
-    // The send already happened. This step just records it.
-    const payClient = await pool.connect();
-    try {
-      await payClient.query("BEGIN");
-      await payClient.query(
         `UPDATE property_payouts SET status = 'paid', flo_txid = $1, paid_at = now() WHERE id = $2`,
         [payoutTxid, id],
       );
-      await payClient.query("COMMIT");
       paid += 1;
     } catch (err) {
-      await payClient.query("ROLLBACK");
       console.error(
-        `CRITICAL: sent ${usdaiAmount} USDAI (txid ${payoutTxid}) for property payout ${id} ` +
-          "but marking it paid failed - needs manual reconciliation:",
+        `CRITICAL: Property payout ${payoutTxid} sent for ${usdaiAmount} USDAI ` +
+          `but DB recording failed - needs manual reconciliation:`,
         err,
       );
+      await pool.query(
+        `INSERT INTO audit_log (event_type, details, created_at)
+         VALUES ('property_payout_orphan', $1, NOW())`,
+        [
+          JSON.stringify({
+            payoutId: id,
+            recipient: payout.recipient_flo_id,
+            amount: usdaiAmount,
+            txid: payoutTxid,
+            issue: "db_recording_failed",
+            error: err.message,
+          }),
+        ],
+      );
       failed += 1;
-    } finally {
-      payClient.release();
     }
   }
 
   return { paid, failed };
 }
 
-// Run contributor releases, then send the pending payouts.
 async function runContributorPayoutCycle() {
   await releaseContributorPayouts();
   return executePropertyPayouts();
 }
 
-// Standalone version of the sum the pipeline already does inline -
-// buy/sell endpoints need a fresh number too, not just once a day.
-async function computeSystemValuation() {
-  const result = await pool.query(
-    `SELECT COALESCE(SUM(base_price), 0)::numeric AS total FROM properties WHERE status = 'active'`,
+// =====================================================================
+// Sell execution - reserve FIRST, then send
+// =====================================================================
+
+async function executeReleasedSells() {
+  const cycleTokenPrice = await getCurrentTokenPrice();
+
+  const queued = await pool.query(
+    `SELECT id, flo_id, token_amount, paid_amount, released_amount 
+     FROM sell_queue
+     WHERE status IN ('partially_released', 'fulfilled')
+       AND paid_amount < released_amount
+       AND payout_locked_at IS NULL`,
   );
-  return Number(result.rows[0]?.total || 0);
+
+  let executed = 0;
+  for (const row of queued.rows) {
+    const newlyReleased = Number(row.released_amount) - Number(row.paid_amount);
+    if (newlyReleased <= 0) continue;
+
+    const usdaiAmount = newlyReleased * cycleTokenPrice;
+
+    const claimClient = await pool.connect();
+    let claimed = false;
+    try {
+      await claimClient.query("BEGIN");
+      const lockResult = await claimClient.query(
+        `SELECT payout_locked_at FROM sell_queue WHERE id = $1 FOR UPDATE`,
+        [row.id],
+      );
+      if (!lockResult.rows.length || lockResult.rows[0].payout_locked_at) {
+        await claimClient.query("ROLLBACK");
+        continue;
+      }
+      const reserved = await reservePlatformLiquidity(claimClient, usdaiAmount);
+      if (!reserved) {
+        await claimClient.query("ROLLBACK");
+        console.error(
+          `Sell payout for queue row ${row.id}: insufficient liquidity, leaving unlocked`,
+        );
+        continue;
+      }
+      await claimClient.query(
+        `UPDATE sell_queue SET payout_locked_at = now() WHERE id = $1`,
+        [row.id],
+      );
+      await claimClient.query("COMMIT");
+      claimed = true;
+    } catch (err) {
+      await claimClient.query("ROLLBACK");
+      console.error(
+        `Failed to claim sell payout for queue row ${row.id}:`,
+        err,
+      );
+    } finally {
+      claimClient.release();
+    }
+    if (!claimed) continue;
+
+    let payoutTxid;
+    try {
+      payoutTxid = await sendUsdaiPayment(row.flo_id, usdaiAmount);
+    } catch (sendErr) {
+      console.error(
+        `Sell payout send failed for queue row ${row.id}, refunding liquidity and unlocking:`,
+        sendErr,
+      );
+      await pool.query(
+        `UPDATE platform_liquidity SET balance = balance + $1, updated_at = now() WHERE id = 1`,
+        [usdaiAmount],
+      );
+      await pool.query(
+        `UPDATE sell_queue SET payout_locked_at = NULL WHERE id = $1`,
+        [row.id],
+      );
+      continue;
+    }
+
+    const finalClient = await pool.connect();
+    try {
+      await finalClient.query("BEGIN");
+
+      await finalClient.query(
+        `UPDATE sell_queue 
+        SET paid_amount = released_amount,
+        status = CASE
+         WHEN released_amount >= token_amount THEN 'paid'
+         ELSE 'partially_released'
+        END,
+       payout_txid = $1
+      WHERE id = $2`,
+        [payoutTxid, row.id],
+      );
+      await finalClient.query(
+        `UPDATE main_token_balances SET balance = balance - $1, updated_at = now() WHERE flo_id = $2`,
+        [newlyReleased, row.flo_id],
+      );
+      await finalClient.query(
+        `
+        INSERT INTO main_token_transactions (flo_id, type, token_amount, price_at_time, payment_txid)
+        VALUES ($1, 'sell', $2, $3, $4)
+        `,
+        [row.flo_id, newlyReleased, cycleTokenPrice, payoutTxid],
+      );
+
+      await finalClient.query("COMMIT");
+      executed += 1;
+    } catch (err) {
+      await finalClient.query("ROLLBACK");
+      console.error(
+        `CRITICAL: Sell payout ${payoutTxid} sent to ${row.flo_id} for ${usdaiAmount} USDAI ` +
+          `but DB recording failed - needs manual reconciliation:`,
+        err,
+      );
+      await pool.query(
+        `INSERT INTO audit_log (event_type, details, created_at)
+         VALUES ('sell_payout_orphan', $1, NOW())`,
+        [
+          JSON.stringify({
+            queueRowId: row.id,
+            floId: row.flo_id,
+            amount: usdaiAmount,
+            txid: payoutTxid,
+            issue: "db_recording_failed",
+            error: err.message,
+          }),
+        ],
+      );
+    } finally {
+      finalClient.release();
+    }
+  }
+
+  return { executed, cyclePrice: cycleTokenPrice };
 }
 
-// --- Portfolio rebalancing ---------------------------------------------------
-// Each holder's position is a snapshot, not a fixed claim on specific
-// properties - every run, we take what a holder's portfolio is currently
-// worth, wipe their positions, and re-split that same value across
-// whatever's in the Top 100 now. That's what makes it "automatically
-// rebalance" - a property dropping out of the Top 100 doesn't leave a
-// holder stuck holding a dead asset, it just stops getting a share next
-// time this runs.
-// Rebalances from each holder's actual Main Token balance, not from the
-// old position rows - token_amount and value are different units
-// (token quantity vs. dollar value) and re-deriving totalValue from a
-// SUM(value) of prior positions would compound any drift between them.
+// =====================================================================
+// PORTFOLIO REBALANCING
+// =====================================================================
+
 async function rebalancePortfolioPositions(top100Properties, tokenPrice) {
   const allocation = computePortfolioAllocation(top100Properties);
   if (!allocation.length) return { rebalanced: 0 };
@@ -1785,136 +2379,232 @@ async function rebalancePortfolioPositions(top100Properties, tokenPrice) {
   return { rebalanced };
 }
 
-// --- Sell execution (finishing the loop) --------------------------------------
-// This sends the released slice of each sell request and records it once.
-async function executeReleasedSells() {
-  const queued = await pool.query(
-    `SELECT id, flo_id, token_amount, released_amount, paid_amount FROM sell_queue
-     WHERE status IN ('partially_released', 'fulfilled')`,
-  );
+// =====================================================================
+// PIPELINE
+// =====================================================================
 
-  let executed = 0;
-  for (const row of queued.rows) {
-    const newlyReleased = Number(row.released_amount) - Number(row.paid_amount);
-    if (newlyReleased <= 0) continue;
-
-    const tokenPrice = computeMainTokenPrice(
-      await computeSystemValuation(),
-      await getTotalMainTokenSupply(),
-    );
-    const usdaiAmount = newlyReleased * tokenPrice;
-
-    const claimClient = await pool.connect();
-    let payoutTxid;
-    try {
-      await claimClient.query("BEGIN");
-      const claimed = await claimClient.query(
-        `SELECT id, paid_amount, released_amount, status FROM sell_queue
-         WHERE id = $1 AND status IN ('partially_released', 'fulfilled') FOR UPDATE`,
-        [row.id],
-      );
-      if (!claimed.rows.length) {
-        await claimClient.query("ROLLBACK");
-        continue;
-      }
-
-      const lockedRow = claimed.rows[0];
-      const lockedNewlyReleased =
-        Number(lockedRow.released_amount) - Number(lockedRow.paid_amount);
-      if (lockedNewlyReleased <= 0) {
-        await claimClient.query("ROLLBACK");
-        continue;
-      }
-
-      const lockedUsdaiAmount = lockedNewlyReleased * tokenPrice;
-      const reserved = await reservePlatformLiquidity(
-        claimClient,
-        lockedUsdaiAmount,
-      );
-      if (!reserved) {
-        await claimClient.query("ROLLBACK");
-        continue;
-      }
-
-      await claimClient.query(
-        `UPDATE sell_queue SET status = 'sending' WHERE id = $1`,
-        [row.id],
-      );
-      await claimClient.query("COMMIT");
-
-      payoutTxid = await sendUsdaiPayment(row.flo_id, lockedUsdaiAmount);
-
-      // Record the txid right away, best-effort, before anything else
-      // that could fail - if the finalize step below fails, this is the
-      // difference between "the txid is stuck in a log line" and "the
-      // txid is on the row, ready for reconciliation."
-      try {
-        await pool.query(
-          `UPDATE sell_queue SET payout_txid = $1 WHERE id = $2`,
-          [payoutTxid, row.id],
-        );
-      } catch (txidErr) {
-        console.error(
-          `Sent ${lockedUsdaiAmount} USDAI (txid ${payoutTxid}) for sell_queue row ${row.id} ` +
-            "but failed to record the txid on the row:",
-          txidErr,
-        );
-      }
-    } catch (err) {
-      try {
-        await claimClient.query("ROLLBACK");
-      } catch (_) {}
-      console.error(`Sell payout failed for queue row ${row.id}:`, err);
-      continue;
-    } finally {
-      claimClient.release();
-    }
-
-    const finalClient = await pool.connect();
-    try {
-      await finalClient.query("BEGIN");
-      await finalClient.query(
-        `UPDATE sell_queue SET paid_amount = released_amount, status = 'paid' WHERE id = $1`,
-        [row.id],
-      );
-      await finalClient.query(
-        `UPDATE main_token_balances SET balance = balance - $1, updated_at = now() WHERE flo_id = $2`,
-        [newlyReleased, row.flo_id],
-      );
-      await finalClient.query(
-        `
-        INSERT INTO main_token_transactions (flo_id, type, token_amount, price_at_time, payment_txid)
-        VALUES ($1, 'sell', $2, $3, $4)
-        `,
-        [row.flo_id, newlyReleased, tokenPrice, payoutTxid],
-      );
-      await finalClient.query("COMMIT");
-      executed += 1;
-    } catch (err) {
-      await finalClient.query("ROLLBACK");
-      console.error(
-        `CRITICAL: sent ${usdaiAmount} USDAI (txid ${payoutTxid}) to ${row.flo_id} for sell_queue row ${row.id} ` +
-          "but recording it failed - needs manual reconciliation:",
-        err,
-      );
-    } finally {
-      finalClient.release();
-    }
-  }
-
-  return { executed };
+async function updatePropertyLifecycles() {
+  await pool.query(`
+    UPDATE properties 
+    SET lifecycle_state = 'graduated',
+        graduated_at = now()
+    WHERE lifecycle_state = 'eligible'
+      AND status = 'active'
+      AND NOT in_global_top_100
+      AND consumption >= 1000
+      AND created_at < now() - INTERVAL '14 days'
+  `);
 }
 
-// ---------------------------------------------------------------------
-// Ranking pipeline
-//
-// Rank populated properties, update their scores and prices,
-// maintain the Top 100.
-// Categories with independent ranking get their own Top 100;
-// the rest share the global Top 100.
-// ---------------------------------------------------------------------
+// =====================================================================
+// FINANCE ALLOCATION
+// =====================================================================
+
+async function computeFinanceAllocation(propertyId) {
+  const components = await pool.query(
+    `SELECT * FROM finance_components WHERE property_id = $1`,
+    [propertyId],
+  );
+
+  const propertyData = await pool.query(
+    `SELECT consumption, current_price, scarcity_score, utility_score, 
+            lifecycle_state, created_at, in_top_100, in_global_top_100
+     FROM properties WHERE id = $1`,
+    [propertyId],
+  );
+  const property = propertyData.rows[0];
+
+  if (!property) {
+    return {
+      allocations: [],
+      algorithmInputs: {},
+      componentCount: 0,
+      hasFinancePlanning: false,
+      hasRoyaltySplits: false,
+      hasBudget: false,
+      hasFinancialTask: false,
+    };
+  }
+
+  const algorithmInputs = {
+    consumption: Number(property.consumption || 0),
+    price: Number(property.current_price || 0),
+    scarcity: Number(property.scarcity_score || 0),
+    utility: Number(property.utility_score || 0),
+    lifecycle: property.lifecycle_state || "incubating",
+    inTop100: property.in_global_top_100 || false,
+    age:
+      (Date.now() - new Date(property.created_at).getTime()) /
+      (1000 * 60 * 60 * 24),
+  };
+
+  if (!components.rows.length) {
+    return {
+      algorithmInputs,
+      componentCount: 0,
+      hasFinancePlanning: false,
+      hasRoyaltySplits: false,
+      hasBudget: false,
+      hasFinancialTask: false,
+      allocations: [],
+    };
+  }
+
+  const allocations = [];
+  let hasRoyaltySplits = false;
+  let hasBudget = false;
+  let hasFinancialPlan = false;
+  let hasFinancialTask = false;
+  let royaltySplitCount = 0;
+
+  for (const comp of components.rows) {
+    const rsResult = await pool.query(
+      `SELECT COUNT(*)::int FROM royalty_splits WHERE finance_component_id = $1`,
+      [comp.id],
+    );
+    const rsCount = rsResult.rows[0]?.count || 0;
+    royaltySplitCount += rsCount;
+
+    if (comp.component_type === "royalty_split" && rsCount > 0) {
+      hasRoyaltySplits = true;
+    } else if (comp.component_type === "budget") {
+      hasBudget = true;
+    } else if (comp.component_type === "financial_plan") {
+      hasFinancialPlan = true;
+    } else if (comp.component_type === "financial_task") {
+      hasFinancialTask = true;
+    }
+
+    allocations.push({
+      componentId: comp.id,
+      type: comp.component_type,
+      title: comp.title,
+      description: comp.description,
+      currency: comp.currency || null,
+      royaltySplitCount: rsCount,
+    });
+  }
+
+  const componentCount = components.rows.length;
+
+  return {
+    hasFinancePlanning: hasFinancialPlan,
+    hasRoyaltySplits,
+    hasBudget,
+    hasFinancialPlan,
+    hasFinancialTask,
+    componentCount,
+    royaltySplitCount,
+    allocations,
+    algorithmInputs,
+  };
+}
+
+async function runFinancialAllocation() {
+  const top100 = await getGlobalTop100();
+  const rawAllocations = [];
+
+  for (const property of top100) {
+    const financeAllocation = await computeFinanceAllocation(property.id);
+    const consumption = await computePropertyConsumption(property.id);
+
+    const totalConsumptionResult = await pool.query(
+      `SELECT COALESCE(SUM(consumption), 1)::numeric AS total 
+       FROM properties WHERE in_global_top_100 = true`,
+    );
+    const totalConsumption = Number(totalConsumptionResult.rows[0]?.total || 1);
+    const consumptionShare = consumption / totalConsumption;
+
+    let rawScore = 0;
+
+    rawScore += consumptionShare * 100;
+
+    const priceFactor = Number(property.current_price) / 1000;
+    rawScore += priceFactor * 5;
+
+    const scarcity = Number(property.scarcity_score || 0);
+    if (scarcity > 2) {
+      rawScore += (scarcity - 2) * 2;
+    }
+
+    const utility = Number(property.utility_score || 0);
+    if (utility > 5) {
+      rawScore += (utility - 5) * 1.5;
+    }
+
+    let lifecycleFactor = 1;
+    if (property.lifecycle_state === "graduated") lifecycleFactor = 1.3;
+    else if (property.lifecycle_state === "eligible") lifecycleFactor = 1.1;
+    else if (property.lifecycle_state === "incubating") lifecycleFactor = 0.8;
+    rawScore = rawScore * lifecycleFactor;
+
+    if (financeAllocation.hasFinancePlanning) {
+      rawScore = rawScore * 1.1;
+    }
+
+    if (rawScore < 0.1) rawScore = 0.1;
+
+    rawAllocations.push({
+      property_id: property.id,
+      rawScore: rawScore,
+      lifecycle: property.lifecycle_state,
+      consumption: consumption,
+      price: property.current_price,
+      componentCount: financeAllocation.componentCount || 0,
+      royaltySplitCount: financeAllocation.royaltySplitCount || 0,
+    });
+  }
+
+  const totalRawScore = rawAllocations.reduce((sum, a) => sum + a.rawScore, 0);
+
+  if (totalRawScore > 0) {
+    for (const alloc of rawAllocations) {
+      const normalizedPercentage = (alloc.rawScore / totalRawScore) * 100;
+
+      await pool.query(
+        `INSERT INTO property_finance_allocations 
+          (property_id, category, amount, allocation_pct, description)
+         VALUES ($1, 'algorithmic', 0, $2, $3)
+         ON CONFLICT (property_id, category) 
+         DO UPDATE SET 
+          amount = 0,
+          allocation_pct = EXCLUDED.allocation_pct,
+          description = EXCLUDED.description,
+          updated_at = now()`,
+        [
+          alloc.property_id,
+          normalizedPercentage,
+          `Algorithmic finance priority: score=${alloc.rawScore.toFixed(2)}, lifecycle=${alloc.lifecycle || "unknown"}, components=${alloc.componentCount}, royalty_splits=${alloc.royaltySplitCount}`,
+        ],
+      );
+    }
+
+    console.log(
+      `Financial allocation normalized for ${rawAllocations.length} properties, ` +
+        `all allocations sum to ${rawAllocations.reduce((sum, a) => sum + (a.rawScore / totalRawScore) * 100, 0).toFixed(2)}%`,
+    );
+  } else {
+    console.warn("No raw scores calculated for finance allocation");
+  }
+
+  return { updated: rawAllocations.length };
+}
+
+// =====================================================================
+// MARKETPLACE PIPELINE
+// =====================================================================
+
 async function runMarketplacePipeline() {
-  console.log("Running marketplace pipeline...");
+  if (pipelineRunning) {
+    console.log("Pipeline already running, skipping...");
+    return;
+  }
+
+  pipelineRunning = true;
+  pipelineLockTime = Date.now();
+  pipelineStartTime = Date.now();
+
+  console.log(`Starting marketplace pipeline at ${new Date().toISOString()}`);
 
   try {
     const populated = await pool.query(`
@@ -1924,12 +2614,11 @@ async function runMarketplacePipeline() {
         AND (
           EXISTS (SELECT 1 FROM property_components pc WHERE pc.property_id = p.id)
           OR EXISTS (SELECT 1 FROM property_people pp WHERE pp.property_id = p.id)
-          OR EXISTS (SELECT 1 FROM financing_positions fp WHERE fp.property_id = p.id)
+          OR EXISTS (SELECT 1 FROM finance_components fc WHERE fc.property_id = p.id)
           OR EXISTS (SELECT 1 FROM property_tasks pt WHERE pt.property_id = p.id)
         )
     `);
 
-    // Recompute price from the property's consumption-driven base price, scarcity score, and utility score.
     const scored = [];
     for (const property of populated.rows) {
       const scarcity = await computeScarcityScore(property.id);
@@ -1943,10 +2632,6 @@ async function runMarketplacePipeline() {
       const newStreak =
         scarcity > 2.0 ? (property.high_scarcity_streak || 0) + 1 : 0;
 
-      // current_price is still the full scarcity/utility-adjusted price -
-      // buy/sell code downstream doesn't need to change at all. base_price
-      // is the new piece, stored separately since system_valuation (for
-      // the Main Token) sums base_price, not current_price.
       await pool.query(
         `
         UPDATE properties
@@ -1982,7 +2667,8 @@ async function runMarketplacePipeline() {
       });
     }
 
-    // 3: rank into top 100, respecting each category's ranking mode
+    await updatePropertyLifecycles();
+
     const categories = await pool.query(
       "SELECT id, independent_ranking FROM categories",
     );
@@ -1990,73 +2676,117 @@ async function runMarketplacePipeline() {
       categories.rows.filter((c) => c.independent_ranking).map((c) => c.id),
     );
 
-    // Reset first, so properties that fall out of a top 100 lose the flag.
     await pool.query(
-      "UPDATE properties SET category_rank = NULL, in_top_100 = false WHERE id = ANY($1)",
+      `UPDATE properties 
+       SET category_rank = NULL, 
+           in_top_100 = false, 
+           in_global_top_100 = false 
+       WHERE id = ANY($1)`,
       [scored.map((s) => s.id)],
     );
 
-    async function rankAndFlag(list) {
-      const ranked = [...list].sort((a, b) => b.price - a.price).slice(0, 100);
-      for (let i = 0; i < ranked.length; i++) {
+    const globalEligible = scored.filter(
+      (s) => !independentCategoryIds.has(s.category_id),
+    );
+    const globalRanked = [...globalEligible]
+      .sort((a, b) => b.price - a.price)
+      .slice(0, 100);
+
+    for (let i = 0; i < globalRanked.length; i++) {
+      await pool.query(
+        `UPDATE properties 
+         SET category_rank = $1, 
+             in_top_100 = true, 
+             in_global_top_100 = true 
+         WHERE id = $2`,
+        [i + 1, globalRanked[i].id],
+      );
+    }
+
+    for (const categoryId of independentCategoryIds) {
+      const categoryScored = scored.filter((s) => s.category_id === categoryId);
+      const categoryRanked = [...categoryScored]
+        .sort((a, b) => b.price - a.price)
+        .slice(0, 100);
+
+      for (let i = 0; i < categoryRanked.length; i++) {
         await pool.query(
-          `UPDATE properties SET category_rank = $1, in_top_100 = true WHERE id = $2`,
-          [i + 1, ranked[i].id],
+          `UPDATE properties 
+           SET category_rank = $1, 
+               in_top_100 = true, 
+               in_global_top_100 = false 
+           WHERE id = $2`,
+          [i + 1, categoryRanked[i].id],
         );
       }
     }
 
-    // Global pool: every scored property in a non-independent category.
-    const globalTop100 = [...scored]
-      .filter((s) => !independentCategoryIds.has(s.category_id))
-      .sort((a, b) => b.price - a.price)
-      .slice(0, 100);
-    await rankAndFlag(globalTop100);
-
-    // Independent pools: each graduated category ranks only within itself.
-    for (const categoryId of independentCategoryIds) {
-      await rankAndFlag(scored.filter((s) => s.category_id === categoryId));
-    }
-
-    // 4: Main Token price uses the shared valuation helper.
     const systemValuation = await computeSystemValuation();
     const totalSupply = await getTotalMainTokenSupply();
     const tokenPrice = computeMainTokenPrice(systemValuation, totalSupply);
     await recordMainTokenPrice(tokenPrice, totalSupply, systemValuation);
 
-    // 5: Open sells once liquidity is high enough.
+    const financeResult = await runFinancialAllocation();
+    console.log(
+      `Financial allocation updated for ${financeResult.updated} properties`,
+    );
+
     await releaseSellQueue();
-
-    // 6: Pay sells, then rebalance the Top 100 portfolio.
     await executeReleasedSells();
-    await rebalancePortfolioPositions(globalTop100, tokenPrice);
 
-    // 7: Finish with contributor payouts.
+    const top100 = await getGlobalTop100();
+    await rebalancePortfolioPositions(top100, tokenPrice);
+
     const payoutResult = await runContributorPayoutCycle();
 
+    const duration = Math.round((Date.now() - pipelineStartTime) / 1000);
     console.log(
-      `Marketplace pipeline run complete (${scored.length} properties scored, ` +
+      `Marketplace pipeline complete (${duration}s): ${scored.length} properties scored, ` +
+        `global_top_100=${top100.length}, ` +
         `system_valuation=${systemValuation}, token_price=${tokenPrice}, ` +
-        `payouts: ${payoutResult.paid} paid / ${payoutResult.failed} failed)`,
+        `payouts: ${payoutResult.paid} paid / ${payoutResult.failed} failed`,
     );
   } catch (err) {
     console.error("Marketplace pipeline error:", err);
+    try {
+      await pool.query(
+        `INSERT INTO audit_log (event_type, details, created_at)
+         VALUES ('pipeline_error', $1, NOW())`,
+        [JSON.stringify({ error: err.message, stack: err.stack })],
+      );
+    } catch (logErr) {
+      console.error("Failed to log pipeline error:", logErr);
+    }
+  } finally {
+    pipelineRunning = false;
+    pipelineLockTime = null;
+    pipelineStartTime = null;
+    console.log("Pipeline lock released");
   }
 }
 
-// Run once a day by default. Also exposed via a manual-trigger endpoint
-// below for testing without waiting 24h.
-const PIPELINE_INTERVAL_MS = 24 * 60 * 60 * 1000;
+const PIPELINE_INTERVAL_MS = 5 * 60 * 1000;
 const marketplacePipelineInterval = setInterval(
   runMarketplacePipeline,
   PIPELINE_INTERVAL_MS,
 );
 
-// ---------------------------------------------------------------------
-// API: Categories
-// ---------------------------------------------------------------------
+// =====================================================================
+// Run orphan reconciliation on startup
+// =====================================================================
 
-// GET /api/categories
+setTimeout(async () => {
+  try {
+    await reconcileOrphanPayouts();
+  } catch (err) {
+    console.error("Orphan reconciliation failed on startup:", err);
+  }
+}, 5000);
+
+// =====================================================================
+// API: CATEGORIES
+// =====================================================================
+
 app.get("/api/categories", async (req, res) => {
   try {
     const result = await pool.query("SELECT * FROM categories ORDER BY name");
@@ -2067,13 +2797,14 @@ app.get("/api/categories", async (req, res) => {
   }
 });
 
-// POST /api/categories - create/upsert a category. Admin-only
 app.post(
   "/api/categories",
-  verifyFloSignature(["adminFloId", "slug", "name", "time"], {
+  secureEndpoint({
+    fields: ["adminFloId", "slug", "name", "time"],
     floIdField: "adminFloId",
+    requireAdmin: true,
+    rateLimitOpts: { max: 5, windowMs: 60000 },
   }),
-  requireAdmin("adminFloId"),
   async (req, res) => {
     const { slug, name } = req.body;
 
@@ -2086,10 +2817,16 @@ app.post(
     try {
       const result = await pool.query(
         `INSERT INTO categories (slug, name) VALUES ($1, $2)
-       ON CONFLICT (slug) DO UPDATE SET name = EXCLUDED.name
-       RETURNING *`,
+         ON CONFLICT (slug) DO UPDATE SET name = EXCLUDED.name
+         RETURNING *`,
         [slug, name],
       );
+      await logAuditEvent("category_created", {
+        floId: req.verifiedFloId,
+        slug,
+        name,
+        ip: req.ip,
+      });
       res.json({ success: true, category: result.rows[0] });
     } catch (err) {
       console.error(err);
@@ -2098,8 +2835,6 @@ app.post(
   },
 );
 
-// GET /api/categories/:slug/components?component=music
-// Component-discovery only, by raw engagement (plays+likes) - this is NOT the marketplace ranking. Marketplace ranking is Property-based (see GET /api/categories/:slug/properties?top100=true and the ranking pipeline above). This endpoint just helps an admin find which lyrics/music/marketing/vocals components are worth attaching to a bundle via POST /api/properties/:propertyId/components.
 app.get("/api/categories/:slug/components", async (req, res) => {
   const { slug } = req.params;
   const componentType = req.query.component;
@@ -2147,20 +2882,23 @@ app.get("/api/categories/:slug/components", async (req, res) => {
   }
 });
 
-// ---------------------------------------------------------------------
-// API: Track components
-// ---------------------------------------------------------------------
+// =====================================================================
+// API: TRACK COMPONENTS
+// =====================================================================
 
-// POST /api/tracks/:trackId/components
-// { contributorFloId, categorySlug, componentType, metadata, time, pubKey, sign }
-// Signed but not admin-gated - a creator registering their own track's
-// components is a normal action, just needs to actually be them.
 app.post(
   "/api/tracks/:trackId/components",
-  verifyFloSignature(
-    ["trackId", "contributorFloId", "categorySlug", "componentType", "time"],
-    { floIdField: "contributorFloId" },
-  ),
+  secureEndpoint({
+    fields: [
+      "trackId",
+      "contributorFloId",
+      "categorySlug",
+      "componentType",
+      "time",
+    ],
+    floIdField: "contributorFloId",
+    rateLimitOpts: { max: 10, windowMs: 60000 },
+  }),
   async (req, res) => {
     const { trackId } = req.params;
     const { categorySlug, componentType, contributorFloId, metadata } =
@@ -2194,8 +2932,8 @@ app.post(
       const result = await pool.query(
         `INSERT INTO tracks_components
         (track_id, category_id, component_type, contributor_flo_id, metadata)
-       VALUES ($1, $2, $3, $4, $5)
-       RETURNING *`,
+         VALUES ($1, $2, $3, $4, $5)
+         RETURNING *`,
         [
           trackId,
           category.rows[0].id,
@@ -2205,6 +2943,13 @@ app.post(
         ],
       );
 
+      await logAuditEvent("component_created", {
+        floId: contributorFloId,
+        trackId,
+        componentType,
+        ip: req.ip,
+      });
+
       res.json({ success: true, component: result.rows[0] });
     } catch (err) {
       console.error(err);
@@ -2213,9 +2958,6 @@ app.post(
   },
 );
 
-// GET /api/marketplace/payment-address
-// Public - the buyer needs this to know where to send FLO before calling
-// the property-marketplace buy endpoint with the resulting txid.
 app.get("/api/marketplace/payment-address", (req, res) => {
   if (!MARKETPLACE_FLO_ADDRESS) {
     return res
@@ -2225,9 +2967,6 @@ app.get("/api/marketplace/payment-address", (req, res) => {
   res.json({ success: true, address: MARKETPLACE_FLO_ADDRESS });
 });
 
-// GET /api/main-token/payment-address
-// Public - the buyer needs this to know where to send USDAI before calling
-// the Main Token buy endpoint with the resulting txid.
 app.get("/api/main-token/payment-address", (req, res) => {
   if (!USDAI_PAYMENT_ADDRESS) {
     return res
@@ -2237,18 +2976,16 @@ app.get("/api/main-token/payment-address", (req, res) => {
   res.json({ success: true, address: USDAI_PAYMENT_ADDRESS });
 });
 
-// ---------------------------------------------------------------------
-// API: People
-// A person is a FLO address with a work profile that
-// can be attached to properties via POST /api/properties/:id/people.
-// Self-service (a person registers/updates their own profile) rather
-// than admin-gated - signed as themself, floIdField defaults to "floId".
-// ---------------------------------------------------------------------
+// =====================================================================
+// API: PEOPLE
+// =====================================================================
 
-// POST /api/people  { floId, workProfile, experience, name, cvUrl, time, pubKey, sign }
 app.post(
   "/api/people",
-  verifyFloSignature(["floId", "workProfile", "time"]),
+  secureEndpoint({
+    fields: ["floId", "workProfile", "time"],
+    rateLimitOpts: { max: 10, windowMs: 60000 },
+  }),
   async (req, res) => {
     const { floId, workProfile, experience, name, cvUrl } = req.body;
 
@@ -2272,6 +3009,11 @@ app.post(
          RETURNING *`,
         [floId, workProfile, experience || null, name || null, cvUrl || null],
       );
+      await logAuditEvent("person_created", {
+        floId,
+        workProfile,
+        ip: req.ip,
+      });
       res.json({ success: true, person: result.rows[0] });
     } catch (err) {
       console.error(err);
@@ -2280,7 +3022,6 @@ app.post(
   },
 );
 
-// GET /api/people/:floId
 app.get("/api/people/:floId", async (req, res) => {
   try {
     const result = await pool.query("SELECT * FROM people WHERE flo_id = $1", [
@@ -2298,22 +3039,18 @@ app.get("/api/people/:floId", async (req, res) => {
   }
 });
 
-// ---------------------------------------------------------------------
-// API: Properties (bundles)
-// Property = zero-or-many lyrics + zero-or-many music + zero-or-many
-// marketing + zero-or-many finance + zero-or-many people, all attached
-// under a category. Creating and attaching to a bundle is admin-only;
-// reading is open.
-// ---------------------------------------------------------------------
+// =====================================================================
+// API: PROPERTIES
+// =====================================================================
 
-// POST /api/properties  { adminFloId, categorySlug, name, time, pubKey, sign }
-// Creates the bundle.
 app.post(
   "/api/properties",
-  verifyFloSignature(["adminFloId", "categorySlug", "name", "time"], {
+  secureEndpoint({
+    fields: ["adminFloId", "categorySlug", "name", "time"],
     floIdField: "adminFloId",
+    requireAdmin: true,
+    rateLimitOpts: { max: 5, windowMs: 60000 },
   }),
-  requireAdmin("adminFloId"),
   async (req, res) => {
     const { adminFloId, categorySlug, name } = req.body;
 
@@ -2340,13 +3077,20 @@ app.post(
       }
 
       const property = await client.query(
-        `INSERT INTO properties (category_id, name, created_by_flo_id)
-         VALUES ($1, $2, $3)
+        `INSERT INTO properties (category_id, name, created_by_flo_id, lifecycle_state, incubation_started_at)
+         VALUES ($1, $2, $3, 'incubating', now())
          RETURNING *`,
         [category.rows[0].id, name, adminFloId],
       );
 
       await client.query("COMMIT");
+      await logAuditEvent("property_created", {
+        floId: adminFloId,
+        propertyId: property.rows[0].id,
+        name,
+        categorySlug,
+        ip: req.ip,
+      });
       res.json({ success: true, property: property.rows[0] });
     } catch (err) {
       await client.query("ROLLBACK");
@@ -2358,22 +3102,16 @@ app.post(
   },
 );
 
-// GET /api/properties?top100=true
-// Global listing across all non-independent categories (or everything if
-// top100=false). This is what the "All Categories" frontend view uses.
 app.get("/api/properties", async (req, res) => {
   const top100Only = req.query.top100 === "true";
 
   try {
-    // Properties in categories that have NOT graduated to independent
-    // ranking share the global pool. If no categories are independent,
-    // this returns all active properties.
     const result = await pool.query(
       `SELECT p.* FROM properties p
        JOIN categories c ON c.id = p.category_id
        WHERE p.status = 'active'
          AND c.independent_ranking = false
-         ${top100Only ? "AND p.in_top_100 = true" : ""}
+         ${top100Only ? "AND p.in_global_top_100 = true" : ""}
        ORDER BY p.category_rank ASC NULLS LAST, p.created_at DESC
        LIMIT 100`,
     );
@@ -2385,8 +3123,6 @@ app.get("/api/properties", async (req, res) => {
   }
 });
 
-// GET /api/properties/:propertyId - the bundle plus everything attached
-// to it (components, people, financing).
 app.get("/api/properties/:propertyId", async (req, res) => {
   const { propertyId } = req.params;
 
@@ -2401,7 +3137,7 @@ app.get("/api/properties/:propertyId", async (req, res) => {
         .json({ success: false, error: "Property not found" });
     }
 
-    const [components, people, financing, tasks] = await Promise.all([
+    const [components, people, finance, tasks] = await Promise.all([
       pool.query(
         `SELECT tc.* FROM property_components pc
          JOIN tracks_components tc ON tc.id = pc.component_id
@@ -2409,16 +3145,35 @@ app.get("/api/properties/:propertyId", async (req, res) => {
         [propertyId],
       ),
       pool.query(
-        `SELECT pe.*, pp.role FROM property_people pp
+        `SELECT pe.*, pp.role
+         FROM property_people pp
          JOIN people pe ON pe.flo_id = pp.person_flo_id
          WHERE pp.property_id = $1`,
         [propertyId],
       ),
-      pool.query(`SELECT * FROM financing_positions WHERE property_id = $1`, [
-        propertyId,
-      ]),
       pool.query(
-        `SELECT t.* FROM property_tasks pt
+        `SELECT fc.*,
+          COALESCE(
+            json_agg(
+              json_build_object(
+                'recipient_flo_id', rs.recipient_flo_id,
+                'share_percentage', rs.share_percentage,
+                'role', rs.role
+              )
+            ) FILTER (WHERE rs.id IS NOT NULL),
+            '[]'
+          ) AS royalty_splits
+         FROM finance_components fc
+         LEFT JOIN royalty_splits rs
+           ON rs.finance_component_id = fc.id
+         WHERE fc.property_id = $1
+         GROUP BY fc.id
+         ORDER BY fc.created_at DESC`,
+        [propertyId],
+      ),
+      pool.query(
+        `SELECT t.*
+         FROM property_tasks pt
          JOIN tasks t ON t.id = pt.task_id
          WHERE pt.property_id = $1`,
         [propertyId],
@@ -2430,7 +3185,7 @@ app.get("/api/properties/:propertyId", async (req, res) => {
       property: property.rows[0],
       components: components.rows,
       people: people.rows,
-      financing: financing.rows,
+      finance: finance.rows,
       tasks: tasks.rows,
     });
   } catch (err) {
@@ -2439,7 +3194,6 @@ app.get("/api/properties/:propertyId", async (req, res) => {
   }
 });
 
-// GET /api/categories/:slug/properties?top100=true
 app.get("/api/categories/:slug/properties", async (req, res) => {
   const { slug } = req.params;
   const top100Only = req.query.top100 === "true";
@@ -2469,15 +3223,14 @@ app.get("/api/categories/:slug/properties", async (req, res) => {
   }
 });
 
-// POST /api/properties/:propertyId/components  { adminFloId, componentId, time, pubKey, sign }
-// Attaches an existing lyrics/music/marketing/vocals component (created
-// via POST /api/tracks/:trackId/components) to the bundle.
 app.post(
   "/api/properties/:propertyId/components",
-  verifyFloSignature(["propertyId", "adminFloId", "componentId", "time"], {
+  secureEndpoint({
+    fields: ["propertyId", "adminFloId", "componentId", "time"],
     floIdField: "adminFloId",
+    requireAdmin: true,
+    rateLimitOpts: { max: 10, windowMs: 60000 },
   }),
-  requireAdmin("adminFloId"),
   async (req, res) => {
     const { propertyId } = req.params;
     const { adminFloId, componentId } = req.body;
@@ -2521,6 +3274,12 @@ app.post(
          ON CONFLICT (property_id, component_id) DO NOTHING`,
         [propertyId, componentId, adminFloId],
       );
+      await logAuditEvent("component_added_to_property", {
+        floId: adminFloId,
+        propertyId,
+        componentId,
+        ip: req.ip,
+      });
       res.json({ success: true });
     } catch (err) {
       console.error(err);
@@ -2529,13 +3288,14 @@ app.post(
   },
 );
 
-// POST /api/properties/:propertyId/components/:componentId/remove  { adminFloId, time, pubKey, sign }
 app.post(
   "/api/properties/:propertyId/components/:componentId/remove",
-  verifyFloSignature(["propertyId", "componentId", "adminFloId", "time"], {
+  secureEndpoint({
+    fields: ["propertyId", "componentId", "adminFloId", "time"],
     floIdField: "adminFloId",
+    requireAdmin: true,
+    rateLimitOpts: { max: 10, windowMs: 60000 },
   }),
-  requireAdmin("adminFloId"),
   async (req, res) => {
     const { propertyId, componentId } = req.params;
     try {
@@ -2543,6 +3303,12 @@ app.post(
         `DELETE FROM property_components WHERE property_id = $1 AND component_id = $2`,
         [propertyId, componentId],
       );
+      await logAuditEvent("component_removed_from_property", {
+        floId: req.verifiedFloId,
+        propertyId,
+        componentId,
+        ip: req.ip,
+      });
       res.json({ success: true });
     } catch (err) {
       console.error(err);
@@ -2551,15 +3317,441 @@ app.post(
   },
 );
 
-// POST /api/properties/:propertyId/tasks  { adminFloId, taskId, time, pubKey, sign }
-// Links an existing task (POST /api/tasks) to a bundle, so a property's
-// detail view can show what work is in flight for it.
+// =====================================================================
+// API: FINANCE COMPONENTS
+// =====================================================================
+
+app.post(
+  "/api/properties/:propertyId/finance-components",
+  secureEndpoint({
+    fields: ["propertyId", "adminFloId", "componentType", "title", "time"],
+    floIdField: "adminFloId",
+    requireAdmin: true,
+    rateLimitOpts: { max: 10, windowMs: 60000 },
+  }),
+  async (req, res) => {
+    const { propertyId } = req.params;
+    const {
+      adminFloId,
+      componentType,
+      title,
+      description,
+      amount,
+      currency = null,
+      terms,
+      metadata,
+      royaltySplits,
+    } = req.body;
+
+    if (!componentType || !title) {
+      return res
+        .status(400)
+        .json({ success: false, error: "Missing componentType or title" });
+    }
+
+    const validTypes = [
+      "budget",
+      "royalty_split",
+      "financial_plan",
+      "financial_task",
+    ];
+    if (!validTypes.includes(componentType)) {
+      return res.status(400).json({
+        success: false,
+        error: `componentType must be one of: ${validTypes.join(", ")}`,
+      });
+    }
+
+    try {
+      const property = await pool.query(
+        "SELECT id FROM properties WHERE id = $1",
+        [propertyId],
+      );
+      if (!property.rows.length) {
+        return res
+          .status(404)
+          .json({ success: false, error: "Property not found" });
+      }
+
+      const client = await pool.connect();
+      let result;
+      try {
+        await client.query("BEGIN");
+
+        const insertResult = await client.query(
+          `INSERT INTO finance_components 
+            (property_id, component_type, title, description, amount, currency, terms, created_by_flo_id, metadata)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+           RETURNING *`,
+          [
+            propertyId,
+            componentType,
+            title,
+            description || null,
+            amount || 0,
+            currency,
+            terms || null,
+            adminFloId,
+            metadata || {},
+          ],
+        );
+        result = insertResult.rows[0];
+
+        if (
+          componentType === "royalty_split" &&
+          royaltySplits &&
+          royaltySplits.length > 0
+        ) {
+          const totalPercentage = royaltySplits.reduce(
+            (sum, s) => sum + Number(s.share_percentage),
+            0,
+          );
+          if (totalPercentage !== 100) {
+            await client.query("ROLLBACK");
+            return res.status(400).json({
+              success: false,
+              error: `Royalty splits must total 100%. Current total: ${totalPercentage}%`,
+            });
+          }
+          for (const split of royaltySplits) {
+            await client.query(
+              `INSERT INTO royalty_splits (finance_component_id, recipient_flo_id, share_percentage, role)
+               VALUES ($1, $2, $3, $4)`,
+              [
+                result.id,
+                split.recipient_flo_id,
+                split.share_percentage,
+                split.role || null,
+              ],
+            );
+          }
+        }
+
+        await client.query("COMMIT");
+        await logAuditEvent("finance_component_created", {
+          floId: adminFloId,
+          propertyId,
+          componentType,
+          title,
+          ip: req.ip,
+        });
+
+        res.json({ success: true, component: result });
+      } catch (err) {
+        await client.query("ROLLBACK");
+        throw err;
+      } finally {
+        client.release();
+      }
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ success: false, error: "Database error" });
+    }
+  },
+);
+
+app.get("/api/properties/:propertyId/finance-components", async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT fc.*, 
+        COALESCE(
+          json_agg(
+            json_build_object(
+              'recipient_flo_id', rs.recipient_flo_id,
+              'share_percentage', rs.share_percentage,
+              'role', rs.role
+            )
+          ) FILTER (WHERE rs.id IS NOT NULL),
+          '[]'
+        ) AS royalty_splits
+       FROM finance_components fc
+       LEFT JOIN royalty_splits rs ON rs.finance_component_id = fc.id
+       WHERE fc.property_id = $1
+       GROUP BY fc.id
+       ORDER BY fc.created_at DESC`,
+      [req.params.propertyId],
+    );
+    res.json({ success: true, components: result.rows });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ success: false, error: "Database error" });
+  }
+});
+
+app.delete(
+  "/api/properties/:propertyId/finance-components/:componentId",
+  secureEndpoint({
+    fields: ["propertyId", "componentId", "adminFloId", "time"],
+    floIdField: "adminFloId",
+    requireAdmin: true,
+    rateLimitOpts: { max: 10, windowMs: 60000 },
+  }),
+  async (req, res) => {
+    const { propertyId, componentId } = req.params;
+
+    try {
+      await pool.query(
+        "DELETE FROM royalty_splits WHERE finance_component_id = $1",
+        [componentId],
+      );
+
+      const result = await pool.query(
+        "DELETE FROM finance_components WHERE id = $1 AND property_id = $2 RETURNING id",
+        [componentId, propertyId],
+      );
+
+      if (!result.rows.length) {
+        return res
+          .status(404)
+          .json({ success: false, error: "Component not found" });
+      }
+
+      await logAuditEvent("finance_component_deleted", {
+        floId: req.verifiedFloId,
+        propertyId,
+        componentId,
+        ip: req.ip,
+      });
+
+      res.json({ success: true });
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ success: false, error: "Database error" });
+    }
+  },
+);
+
+app.get("/api/properties/:propertyId/finance-allocations", async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT * FROM property_finance_allocations 
+       WHERE property_id = $1 
+       ORDER BY allocation_pct DESC`,
+      [req.params.propertyId],
+    );
+
+    res.json({
+      success: true,
+      allocations: result.rows,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ success: false, error: "Database error" });
+  }
+});
+
+// =====================================================================
+// API: TASKS
+// =====================================================================
+
+app.get("/api/tasks", async (req, res) => {
+  try {
+    const result = await pool.query(
+      "SELECT * FROM tasks ORDER BY created_at DESC",
+    );
+    res.json({ success: true, tasks: result.rows });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ success: false, error: "Database error" });
+  }
+});
+
+app.post(
+  "/api/tasks",
+  secureEndpoint({
+    fields: [
+      "adminFloId",
+      "requesterFloId",
+      "brief",
+      "budget",
+      "componentType",
+      "time",
+    ],
+    floIdField: "adminFloId",
+    requireAdmin: true,
+    rateLimitOpts: { max: 5, windowMs: 60000 },
+  }),
+  async (req, res) => {
+    const { requesterFloId, brief, budget, componentType } = req.body;
+
+    if (!requesterFloId || !brief) {
+      return res.status(400).json({
+        success: false,
+        error: "Missing requesterFloId or brief",
+      });
+    }
+
+    if (componentType && !PROPERTY_COMPONENT_TYPES.includes(componentType)) {
+      return res.status(400).json({
+        success: false,
+        error: `componentType must be one of: ${PROPERTY_COMPONENT_TYPES.join(", ")}`,
+      });
+    }
+
+    try {
+      const result = await pool.query(
+        `INSERT INTO tasks (requester_flo_id, brief, budget, component_type)
+         VALUES ($1, $2, $3, $4)
+         RETURNING *`,
+        [requesterFloId, brief, budget || null, componentType || null],
+      );
+      await logAuditEvent("task_created", {
+        floId: req.verifiedFloId,
+        taskId: result.rows[0].id,
+        requesterFloId,
+        brief: brief.substring(0, 100),
+        ip: req.ip,
+      });
+      res.json({ success: true, task: result.rows[0] });
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ success: false, error: "Database error" });
+    }
+  },
+);
+
+app.post(
+  "/api/tasks/:taskId/claim",
+  secureEndpoint({
+    fields: ["taskId", "creatorFloId", "time"],
+    floIdField: "creatorFloId",
+    rateLimitOpts: { max: 10, windowMs: 60000 },
+  }),
+  async (req, res) => {
+    const taskId = parsePositiveInt(req.params.taskId);
+    const { creatorFloId } = req.body;
+
+    if (!taskId) {
+      return res.status(400).json({ success: false, error: "Invalid taskId" });
+    }
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+
+      const task = await client.query(
+        "SELECT * FROM tasks WHERE id = $1 FOR UPDATE",
+        [taskId],
+      );
+      if (!task.rows.length) {
+        await client.query("ROLLBACK");
+        return res
+          .status(404)
+          .json({ success: false, error: "Task not found" });
+      }
+      if (task.rows[0].status !== "open") {
+        await client.query("ROLLBACK");
+        return res
+          .status(409)
+          .json({ success: false, error: "Task is not open" });
+      }
+
+      const updated = await client.query(
+        `UPDATE tasks
+         SET status = 'claimed', fulfilled_by_flo_id = $1, claimed_at = now()
+         WHERE id = $2
+         RETURNING *`,
+        [creatorFloId, taskId],
+      );
+
+      await client.query("COMMIT");
+      await logAuditEvent("task_claimed", {
+        floId: creatorFloId,
+        taskId,
+        ip: req.ip,
+      });
+      res.json({ success: true, task: updated.rows[0] });
+    } catch (err) {
+      await client.query("ROLLBACK");
+      console.error(err);
+      res.status(500).json({ success: false, error: "Database error" });
+    } finally {
+      client.release();
+    }
+  },
+);
+
+app.post(
+  "/api/tasks/:taskId/complete",
+  secureEndpoint({
+    fields: ["taskId", "creatorFloId", "trackId", "time"],
+    floIdField: "creatorFloId",
+    rateLimitOpts: { max: 10, windowMs: 60000 },
+  }),
+  async (req, res) => {
+    const taskId = parsePositiveInt(req.params.taskId);
+    const { creatorFloId, trackId } = req.body;
+
+    if (!taskId) {
+      return res.status(400).json({ success: false, error: "Invalid taskId" });
+    }
+    if (!trackId) {
+      return res.status(400).json({ success: false, error: "Missing trackId" });
+    }
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+
+      const task = await client.query(
+        "SELECT * FROM tasks WHERE id = $1 FOR UPDATE",
+        [taskId],
+      );
+      if (!task.rows.length) {
+        await client.query("ROLLBACK");
+        return res
+          .status(404)
+          .json({ success: false, error: "Task not found" });
+      }
+      const current = task.rows[0];
+      if (current.status !== "claimed") {
+        await client.query("ROLLBACK");
+        return res
+          .status(409)
+          .json({ success: false, error: "Task is not claimed" });
+      }
+      if (current.fulfilled_by_flo_id !== creatorFloId) {
+        await client.query("ROLLBACK");
+        return res.status(403).json({
+          success: false,
+          error: "Not the creator who claimed this task",
+        });
+      }
+
+      const updated = await client.query(
+        `UPDATE tasks
+         SET status = 'completed', track_id = $1, completed_at = now()
+         WHERE id = $2
+         RETURNING *`,
+        [trackId, taskId],
+      );
+
+      await client.query("COMMIT");
+      await logAuditEvent("task_completed", {
+        floId: creatorFloId,
+        taskId,
+        trackId,
+        ip: req.ip,
+      });
+      res.json({ success: true, task: updated.rows[0] });
+    } catch (err) {
+      await client.query("ROLLBACK");
+      console.error(err);
+      res.status(500).json({ success: false, error: "Database error" });
+    } finally {
+      client.release();
+    }
+  },
+);
+
 app.post(
   "/api/properties/:propertyId/tasks",
-  verifyFloSignature(["propertyId", "adminFloId", "taskId", "time"], {
+  secureEndpoint({
+    fields: ["propertyId", "adminFloId", "taskId", "time"],
     floIdField: "adminFloId",
+    requireAdmin: true,
+    rateLimitOpts: { max: 10, windowMs: 60000 },
   }),
-  requireAdmin("adminFloId"),
   async (req, res) => {
     const { propertyId } = req.params;
     const { taskId } = req.body;
@@ -2592,6 +3784,12 @@ app.post(
          ON CONFLICT (property_id, task_id) DO NOTHING`,
         [propertyId, taskId],
       );
+      await logAuditEvent("task_added_to_property", {
+        floId: req.verifiedFloId,
+        propertyId,
+        taskId,
+        ip: req.ip,
+      });
       res.json({ success: true });
     } catch (err) {
       console.error(err);
@@ -2600,13 +3798,14 @@ app.post(
   },
 );
 
-// POST /api/properties/:propertyId/tasks/:taskId/remove  { adminFloId, time, pubKey, sign }
 app.post(
   "/api/properties/:propertyId/tasks/:taskId/remove",
-  verifyFloSignature(["propertyId", "taskId", "adminFloId", "time"], {
+  secureEndpoint({
+    fields: ["propertyId", "taskId", "adminFloId", "time"],
     floIdField: "adminFloId",
+    requireAdmin: true,
+    rateLimitOpts: { max: 10, windowMs: 60000 },
   }),
-  requireAdmin("adminFloId"),
   async (req, res) => {
     const { propertyId, taskId } = req.params;
     try {
@@ -2614,6 +3813,12 @@ app.post(
         `DELETE FROM property_tasks WHERE property_id = $1 AND task_id = $2`,
         [propertyId, taskId],
       );
+      await logAuditEvent("task_removed_from_property", {
+        floId: req.verifiedFloId,
+        propertyId,
+        taskId,
+        ip: req.ip,
+      });
       res.json({ success: true });
     } catch (err) {
       console.error(err);
@@ -2622,14 +3827,18 @@ app.post(
   },
 );
 
-// POST /api/properties/:propertyId/people  { adminFloId, personFloId, role, time, pubKey, sign }
-// personFloId must already have a people profile (POST /api/people).
+// =====================================================================
+// API: PROPERTY PEOPLE
+// =====================================================================
+
 app.post(
   "/api/properties/:propertyId/people",
-  verifyFloSignature(["propertyId", "adminFloId", "personFloId", "time"], {
+  secureEndpoint({
+    fields: ["propertyId", "adminFloId", "personFloId", "time"],
     floIdField: "adminFloId",
+    requireAdmin: true,
+    rateLimitOpts: { max: 10, windowMs: 60000 },
   }),
-  requireAdmin("adminFloId"),
   async (req, res) => {
     const { propertyId } = req.params;
     const { adminFloId, personFloId, role } = req.body;
@@ -2659,6 +3868,13 @@ app.post(
          ON CONFLICT (property_id, person_flo_id, role) DO NOTHING`,
         [propertyId, personFloId, role || "", adminFloId],
       );
+      await logAuditEvent("person_added_to_property", {
+        floId: adminFloId,
+        propertyId,
+        personFloId,
+        role: role || "",
+        ip: req.ip,
+      });
       res.json({ success: true });
     } catch (err) {
       console.error(err);
@@ -2667,13 +3883,14 @@ app.post(
   },
 );
 
-// POST /api/properties/:propertyId/people/:personFloId/remove  { adminFloId, role, time, pubKey, sign }
 app.post(
   "/api/properties/:propertyId/people/:personFloId/remove",
-  verifyFloSignature(["propertyId", "personFloId", "adminFloId", "time"], {
+  secureEndpoint({
+    fields: ["propertyId", "personFloId", "adminFloId", "time"],
     floIdField: "adminFloId",
+    requireAdmin: true,
+    rateLimitOpts: { max: 10, windowMs: 60000 },
   }),
-  requireAdmin("adminFloId"),
   async (req, res) => {
     const { propertyId, personFloId } = req.params;
     const { role } = req.body;
@@ -2682,6 +3899,13 @@ app.post(
         `DELETE FROM property_people WHERE property_id = $1 AND person_flo_id = $2 AND role = $3`,
         [propertyId, personFloId, role || ""],
       );
+      await logAuditEvent("person_removed_from_property", {
+        floId: req.verifiedFloId,
+        propertyId,
+        personFloId,
+        role: role || "",
+        ip: req.ip,
+      });
       res.json({ success: true });
     } catch (err) {
       console.error(err);
@@ -2690,131 +3914,16 @@ app.post(
   },
 );
 
-// POST /api/properties/:propertyId/financing
-// { financierFloId, amount, revenueSharePct, usdaiTxid, time, pubKey, sign }
-// Real-money financing since the Main Token migration: the USDAI payment
-// sent to the USDAI payment address is verified on-chain, the position is
-// credited at its verified value (body.amount is treated as intent only),
-// and the funds go into the ONE shared liquidity pool after the platform
-// cut - same flow as Main Token buys.
-app.post(
-  "/api/properties/:propertyId/financing",
-  verifyFloSignature(
-    [
-      "propertyId",
-      "financierFloId",
-      "amount",
-      "revenueSharePct",
-      "usdaiTxid",
-      "time",
-    ],
-    { floIdField: "financierFloId" },
-  ),
-  async (req, res) => {
-    const { propertyId } = req.params;
-    const { financierFloId, revenueSharePct } = req.body;
-    const usdaiTxid = req.body.usdaiTxid;
+// =====================================================================
+// API: PROPERTY INTEREST
+// =====================================================================
 
-    if (!financierFloId) {
-      return res
-        .status(400)
-        .json({ success: false, error: "Missing financierFloId" });
-    }
-    if (!usdaiTxid) {
-      return res.status(400).json({
-        success: false,
-        error:
-          "Missing usdaiTxid - send USDAI to the USDAI payment address first",
-      });
-    }
-
-    let usdaiValue;
-    try {
-      const payment = await verifyUsdaiPayment(
-        usdaiTxid,
-        MIN_INVESTMENT_USDAI,
-        financierFloId,
-      );
-      usdaiValue = payment.tokenAmount;
-    } catch (err) {
-      console.error("Financing payment verification failed:", err);
-      return res.status(402).json({
-        success: false,
-        error: `Payment verification failed: ${err.message || err}`,
-      });
-    }
-    const { expense, netAfterExpense } = splitInvestment(usdaiValue);
-
-    try {
-      const property = await pool.query(
-        "SELECT id FROM properties WHERE id = $1",
-        [propertyId],
-      );
-      if (!property.rows.length) {
-        return res
-          .status(404)
-          .json({ success: false, error: "Property not found" });
-      }
-
-      const client = await pool.connect();
-      let position;
-      try {
-        await client.query("BEGIN");
-        try {
-          const inserted = await client.query(
-            `INSERT INTO financing_positions
-              (property_id, financier_flo_id, stage, amount, revenue_share_pct, usdai_txid)
-             VALUES ($1, $2, 'property_backing', $3, $4, $5)
-             RETURNING *`,
-            [
-              propertyId,
-              financierFloId,
-              usdaiValue,
-              revenueSharePct || null,
-              usdaiTxid,
-            ],
-          );
-          position = inserted.rows[0];
-        } catch (err) {
-          if (err.code === "23505") {
-            await client.query("ROLLBACK");
-            return res.status(409).json({
-              success: false,
-              error:
-                "This payment has already been credited to a financing position",
-            });
-          }
-          throw err;
-        }
-        await depositToPlatformLiquidity(netAfterExpense, expense, client);
-        await client.query("COMMIT");
-      } catch (err) {
-        await client.query("ROLLBACK");
-        throw err;
-      } finally {
-        client.release();
-      }
-
-      res.json({
-        success: true,
-        position,
-        usdaiValue,
-        platformExpense: expense,
-        liquidityPoolDeposit: netAfterExpense,
-      });
-    } catch (err) {
-      console.error(err);
-      res.status(500).json({ success: false, error: "Database error" });
-    }
-  },
-);
-
-// POST /api/properties/:propertyId/interest  { floId, intent, time, pubKey, sign }
-// Signed: hashcontent = [propertyId, floId, intent, time].join("|")
 app.post(
   "/api/properties/:propertyId/interest",
-  rateLimit({ max: 20, windowMs: 60000 }),
-  verifyFloSignature(["propertyId", "floId", "intent", "time"]),
+  secureEndpoint({
+    fields: ["propertyId", "floId", "intent", "time"],
+    rateLimitOpts: { max: 20, windowMs: 60000 },
+  }),
   async (req, res) => {
     const { propertyId } = req.params;
     const { floId, intent } = req.body;
@@ -2840,10 +3949,10 @@ app.post(
   },
 );
 
-const MIN_MAIN_TOKEN_BUY_USDAI = 0.001; // dust floor, just enough to make sure a real payment happened
-const MIN_INVESTMENT_USDAI = 0.001; // same dust floor for financing positions (tasks, tracks, properties)
+// =====================================================================
+// API: MAIN TOKEN
+// =====================================================================
 
-// GET /api/main-token/price - current token price plus the numbers behind it
 app.get("/api/main-token/price", async (req, res) => {
   try {
     const systemValuation = await computeSystemValuation();
@@ -2856,7 +3965,6 @@ app.get("/api/main-token/price", async (req, res) => {
   }
 });
 
-// GET /api/main-token/portfolio/:floId - a holder's current Top-100 exposure
 app.get("/api/main-token/portfolio/:floId", async (req, res) => {
   const { floId } = req.params;
   try {
@@ -2886,12 +3994,12 @@ app.get("/api/main-token/portfolio/:floId", async (req, res) => {
   }
 });
 
-// POST /api/main-token/buy  { floId, usdaiTxid, time, pubKey, sign }
-// USDAI buys mint Main Token and update the Top 100.
 app.post(
   "/api/main-token/buy",
-  rateLimit({ max: 10, windowMs: 60000 }),
-  verifyFloSignature(["floId", "usdaiTxid", "time"]),
+  secureEndpoint({
+    fields: ["floId", "usdaiTxid", "time"],
+    rateLimitOpts: { max: 10, windowMs: 60000 },
+  }),
   async (req, res) => {
     const { floId, usdaiTxid } = req.body;
 
@@ -2913,7 +4021,7 @@ app.post(
         MIN_MAIN_TOKEN_BUY_USDAI,
         floId,
       );
-      usdaiValue = payment.tokenAmount; // 1 USDAI assumed == $1
+      usdaiValue = payment.tokenAmount;
     } catch (err) {
       console.error("Main Token buy payment verification failed:", err);
       return res.status(402).json({
@@ -2929,10 +4037,8 @@ app.post(
       const tokenAmount = usdaiValue / tokenPrice;
       const { expense, netAfterExpense } = splitInvestment(usdaiValue);
 
-      const top100 = await pool.query(
-        "SELECT id, consumption FROM properties WHERE in_top_100 = true",
-      );
-      const allocation = computePortfolioAllocation(top100.rows);
+      const top100 = await getGlobalTop100();
+      const allocation = computePortfolioAllocation(top100);
 
       const client = await pool.connect();
       try {
@@ -2999,6 +4105,15 @@ app.post(
         client.release();
       }
 
+      await logAuditEvent("main_token_buy", {
+        floId,
+        usdaiValue,
+        tokenAmount,
+        tokenPrice,
+        usdaiTxid,
+        ip: req.ip,
+      });
+
       res.json({
         success: true,
         tokenAmount,
@@ -3015,13 +4130,12 @@ app.post(
   },
 );
 
-// POST /api/main-token/sell  { floId, tokenAmount, time, pubKey, sign }
-//
-// Just queues the sell request.
 app.post(
   "/api/main-token/sell",
-  rateLimit({ max: 10, windowMs: 60000 }),
-  verifyFloSignature(["floId", "tokenAmount", "time"]),
+  secureEndpoint({
+    fields: ["floId", "tokenAmount", "time"],
+    rateLimitOpts: { max: 10, windowMs: 60000 },
+  }),
   async (req, res) => {
     const { floId } = req.body;
     const tokenAmount = Number(req.body.tokenAmount);
@@ -3043,11 +4157,9 @@ app.post(
       const balance = Number(balanceResult.rows[0]?.balance || 0);
 
       const outstandingResult = await pool.query(
-        `
-        SELECT COALESCE(SUM(token_amount - paid_amount), 0)::numeric AS outstanding
-        FROM sell_queue
-        WHERE flo_id = $1 AND status != 'fulfilled'
-        `,
+        `SELECT COALESCE(SUM(token_amount - paid_amount), 0)::numeric AS outstanding
+         FROM sell_queue
+         WHERE flo_id = $1 AND paid_amount < token_amount`,
         [floId],
       );
       const alreadyQueued = Number(outstandingResult.rows[0]?.outstanding || 0);
@@ -3069,6 +4181,13 @@ app.post(
       );
 
       const pressureRatio = await computeMainTokenPressureRatio();
+      await logAuditEvent("main_token_sell_queued", {
+        floId,
+        tokenAmount,
+        pressureRatio,
+        ip: req.ip,
+      });
+
       res.json({
         success: true,
         queued: inserted.rows[0],
@@ -3082,7 +4201,6 @@ app.post(
   },
 );
 
-// GET /api/main-token/sell-queue - public transparency metrics so sellers can see how fast the payout queue is moving right now.
 app.get("/api/main-token/sell-queue", async (req, res) => {
   try {
     const pendingResult = await pool.query(
@@ -3091,7 +4209,7 @@ app.get("/api/main-token/sell-queue", async (req, res) => {
              COALESCE(SUM(token_amount - paid_amount), 0)::numeric AS outstanding_tokens,
              MIN(requested_at) AS oldest_requested_at
       FROM sell_queue
-      WHERE status != 'fulfilled'
+      WHERE paid_amount < token_amount
       `,
     );
 
@@ -3122,16 +4240,18 @@ app.get("/api/main-token/sell-queue", async (req, res) => {
   }
 });
 
-// usage event directly moves utility_score (and so price), so it needs
-// to be gated to trusted admins, not just signed by any user.
-// { adminFloId, componentId, usageType, actorFloId, ..., time, pubKey, sign }
+// =====================================================================
+// API: USAGE EVENTS
+// =====================================================================
+
 app.post(
   "/api/properties/:propertyId/usage-events",
-  rateLimit({ max: 20, windowMs: 60000 }),
-  verifyFloSignature(["propertyId", "adminFloId", "usageType", "time"], {
+  secureEndpoint({
+    fields: ["propertyId", "adminFloId", "usageType", "time"],
     floIdField: "adminFloId",
+    requireAdmin: true,
+    rateLimitOpts: { max: 20, windowMs: 60000 },
   }),
-  requireAdmin("adminFloId"),
   async (req, res) => {
     const { propertyId } = req.params;
     const {
@@ -3154,12 +4274,12 @@ app.post(
     try {
       const result = await pool.query(
         `
-      INSERT INTO property_usage_events
-        (property_id, component_id, usage_type, actor_flo_id,
-         rights_duration_days, value_type, value_amount, value_description, metadata)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-      RETURNING *
-      `,
+        INSERT INTO property_usage_events
+          (property_id, component_id, usage_type, actor_flo_id,
+           rights_duration_days, value_type, value_amount, value_description, metadata)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        RETURNING *
+        `,
         [
           propertyId,
           componentId || null,
@@ -3173,6 +4293,13 @@ app.post(
         ],
       );
 
+      await logAuditEvent("usage_event_created", {
+        floId: req.verifiedFloId,
+        propertyId,
+        usageType,
+        ip: req.ip,
+      });
+
       res.json({ success: true, event: result.rows[0] });
     } catch (err) {
       console.error(err);
@@ -3181,489 +4308,85 @@ app.post(
   },
 );
 
-// ---------------------------------------------------------------------
-// API: Financing
-// ---------------------------------------------------------------------
+// =====================================================================
+// API: ADMIN
+// =====================================================================
 
-// POST /api/financing/tasks/:taskId/back
-// { financierFloId, amount, revenueSharePct, usdaiTxid, time, pubKey, sign }
-// Real USDAI payment required - verified on-chain, credited at its verified
-// value, deposited into the one shared liquidity pool after the platform cut.
-app.post(
-  "/api/financing/tasks/:taskId/back",
-  verifyFloSignature(
-    [
-      "taskId",
-      "financierFloId",
-      "amount",
-      "revenueSharePct",
-      "usdaiTxid",
-      "time",
-    ],
-    { floIdField: "financierFloId" },
-  ),
-  async (req, res) => {
-    const { taskId } = req.params;
-    const { financierFloId, revenueSharePct } = req.body;
-    const usdaiTxid = req.body.usdaiTxid;
-
-    if (!financierFloId) {
-      return res
-        .status(400)
-        .json({ success: false, error: "Missing financierFloId" });
-    }
-    if (!usdaiTxid) {
-      return res.status(400).json({
-        success: false,
-        error:
-          "Missing usdaiTxid - send USDAI to the USDAI payment address first",
-      });
-    }
-
-    let usdaiValue;
-    try {
-      const payment = await verifyUsdaiPayment(
-        usdaiTxid,
-        MIN_INVESTMENT_USDAI,
-        financierFloId,
-      );
-      usdaiValue = payment.tokenAmount;
-    } catch (err) {
-      console.error("Financing payment verification failed:", err);
-      return res.status(402).json({
-        success: false,
-        error: `Payment verification failed: ${err.message || err}`,
-      });
-    }
-    const { expense, netAfterExpense } = splitInvestment(usdaiValue);
-
-    try {
-      const task = await pool.query("SELECT id FROM tasks WHERE id = $1", [
-        taskId,
-      ]);
-      if (!task.rows.length) {
-        return res
-          .status(404)
-          .json({ success: false, error: "Task not found" });
-      }
-
-      const client = await pool.connect();
-      let position;
-      try {
-        await client.query("BEGIN");
-        try {
-          const inserted = await client.query(
-            `INSERT INTO financing_positions
-              (task_id, financier_flo_id, stage, amount, revenue_share_pct, usdai_txid)
-             VALUES ($1, $2, 'pre_creation', $3, $4, $5)
-             RETURNING *`,
-            [
-              taskId,
-              financierFloId,
-              usdaiValue,
-              revenueSharePct || null,
-              usdaiTxid,
-            ],
-          );
-          position = inserted.rows[0];
-        } catch (err) {
-          if (err.code === "23505") {
-            await client.query("ROLLBACK");
-            return res.status(409).json({
-              success: false,
-              error:
-                "This payment has already been credited to a financing position",
-            });
-          }
-          throw err;
-        }
-        await depositToPlatformLiquidity(netAfterExpense, expense, client);
-        await client.query("COMMIT");
-      } catch (err) {
-        await client.query("ROLLBACK");
-        throw err;
-      } finally {
-        client.release();
-      }
-
-      res.json({
-        success: true,
-        position,
-        usdaiValue,
-        platformExpense: expense,
-        liquidityPoolDeposit: netAfterExpense,
-      });
-    } catch (err) {
-      console.error(err);
-      res.status(500).json({ success: false, error: "Database error" });
-    }
-  },
-);
-
-// POST /api/financing/tracks/:trackId/invest
-// { financierFloId, amount, revenueSharePct, usdaiTxid, time, pubKey, sign }
-// Real USDAI payment required - verified on-chain, credited at its verified
-// value, deposited into the one shared liquidity pool after the platform cut.
-app.post(
-  "/api/financing/tracks/:trackId/invest",
-  verifyFloSignature(
-    [
-      "trackId",
-      "financierFloId",
-      "amount",
-      "revenueSharePct",
-      "usdaiTxid",
-      "time",
-    ],
-    { floIdField: "financierFloId" },
-  ),
-  async (req, res) => {
-    const { trackId } = req.params;
-    const { financierFloId, revenueSharePct } = req.body;
-    const usdaiTxid = req.body.usdaiTxid;
-
-    if (!financierFloId) {
-      return res
-        .status(400)
-        .json({ success: false, error: "Missing financierFloId" });
-    }
-    if (!usdaiTxid) {
-      return res.status(400).json({
-        success: false,
-        error:
-          "Missing usdaiTxid - send USDAI to the USDAI payment address first",
-      });
-    }
-
-    let usdaiValue;
-    try {
-      const payment = await verifyUsdaiPayment(
-        usdaiTxid,
-        MIN_INVESTMENT_USDAI,
-        financierFloId,
-      );
-      usdaiValue = payment.tokenAmount;
-    } catch (err) {
-      console.error("Financing payment verification failed:", err);
-      return res.status(402).json({
-        success: false,
-        error: `Payment verification failed: ${err.message || err}`,
-      });
-    }
-    const { expense, netAfterExpense } = splitInvestment(usdaiValue);
-
-    try {
-      const client = await pool.connect();
-      let position;
-      try {
-        await client.query("BEGIN");
-        try {
-          const inserted = await client.query(
-            `INSERT INTO financing_positions
-              (track_id, financier_flo_id, stage, amount, revenue_share_pct, usdai_txid)
-             VALUES ($1, $2, 'post_production', $3, $4, $5)
-             RETURNING *`,
-            [
-              trackId,
-              financierFloId,
-              usdaiValue,
-              revenueSharePct || null,
-              usdaiTxid,
-            ],
-          );
-          position = inserted.rows[0];
-        } catch (err) {
-          if (err.code === "23505") {
-            await client.query("ROLLBACK");
-            return res.status(409).json({
-              success: false,
-              error:
-                "This payment has already been credited to a financing position",
-            });
-          }
-          throw err;
-        }
-        await depositToPlatformLiquidity(netAfterExpense, expense, client);
-        await client.query("COMMIT");
-      } catch (err) {
-        await client.query("ROLLBACK");
-        throw err;
-      } finally {
-        client.release();
-      }
-
-      res.json({
-        success: true,
-        position,
-        usdaiValue,
-        platformExpense: expense,
-        liquidityPoolDeposit: netAfterExpense,
-      });
-    } catch (err) {
-      console.error(err);
-      res.status(500).json({ success: false, error: "Database error" });
-    }
-  },
-);
-
-// ---------------------------------------------------------------------
-// API: Task board
-// ---------------------------------------------------------------------
-
-// GET /api/tasks
-app.get("/api/tasks", async (req, res) => {
-  try {
-    const result = await pool.query(
-      "SELECT * FROM tasks ORDER BY created_at DESC",
-    );
-    res.json({ success: true, tasks: result.rows });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ success: false, error: "Database error" });
-  }
-});
-
-// POST /api/tasks  { adminFloId, requesterFloId, brief, budget, componentType, time, pubKey, sign }
-// componentType is what kind of creative work this is asking for
-// ("generate lyrics for X") - optional, but when given must be one of
-// PROPERTY_COMPONENT_TYPES so it can be filtered/tagged consistently
-// with the rest of the marketplace.
-// Admin-only, same as categories/usage-events - keeps the task board
-// from being spammed with junk listings.
-app.post(
-  "/api/tasks",
-  verifyFloSignature(
-    [
-      "adminFloId",
-      "requesterFloId",
-      "brief",
-      "budget",
-      "componentType",
-      "time",
-    ],
-    { floIdField: "adminFloId" },
-  ),
-  requireAdmin("adminFloId"),
-  async (req, res) => {
-    const { requesterFloId, brief, budget, componentType } = req.body;
-
-    if (!requesterFloId || !brief) {
-      return res.status(400).json({
-        success: false,
-        error: "Missing requesterFloId or brief",
-      });
-    }
-
-    if (componentType && !PROPERTY_COMPONENT_TYPES.includes(componentType)) {
-      return res.status(400).json({
-        success: false,
-        error: `componentType must be one of: ${PROPERTY_COMPONENT_TYPES.join(", ")}`,
-      });
-    }
-
-    try {
-      const result = await pool.query(
-        `INSERT INTO tasks (requester_flo_id, brief, budget, component_type)
-         VALUES ($1, $2, $3, $4)
-         RETURNING *`,
-        [requesterFloId, brief, budget || null, componentType || null],
-      );
-      res.json({ success: true, task: result.rows[0] });
-    } catch (err) {
-      console.error(err);
-      res.status(500).json({ success: false, error: "Database error" });
-    }
-  },
-);
-
-// POST /api/tasks/:taskId/claim  { creatorFloId, time, pubKey, sign }
-// Signed: hashcontent = [taskId, creatorFloId, time].join("|")
-// A creator claims an open task, committing to do the work. Row-locked
-// the same way other row-locked actions are, so two creators racing to claim the
-// same task can't both succeed.
-app.post(
-  "/api/tasks/:taskId/claim",
-  rateLimit({ max: 10, windowMs: 60000 }),
-  verifyFloSignature(["taskId", "creatorFloId", "time"], {
-    floIdField: "creatorFloId",
-  }),
-  async (req, res) => {
-    const taskId = parsePositiveInt(req.params.taskId);
-    const { creatorFloId } = req.body;
-
-    if (!taskId) {
-      return res.status(400).json({ success: false, error: "Invalid taskId" });
-    }
-
-    const client = await pool.connect();
-    try {
-      await client.query("BEGIN");
-
-      const task = await client.query(
-        "SELECT * FROM tasks WHERE id = $1 FOR UPDATE",
-        [taskId],
-      );
-      if (!task.rows.length) {
-        await client.query("ROLLBACK");
-        return res
-          .status(404)
-          .json({ success: false, error: "Task not found" });
-      }
-      if (task.rows[0].status !== "open") {
-        await client.query("ROLLBACK");
-        return res
-          .status(409)
-          .json({ success: false, error: "Task is not open" });
-      }
-
-      const updated = await client.query(
-        `UPDATE tasks
-         SET status = 'claimed', fulfilled_by_flo_id = $1, claimed_at = now()
-         WHERE id = $2
-         RETURNING *`,
-        [creatorFloId, taskId],
-      );
-
-      await client.query("COMMIT");
-      res.json({ success: true, task: updated.rows[0] });
-    } catch (err) {
-      await client.query("ROLLBACK");
-      console.error(err);
-      res.status(500).json({ success: false, error: "Database error" });
-    } finally {
-      client.release();
-    }
-  },
-);
-
-// POST /api/tasks/:taskId/complete  { creatorFloId, trackId, time, pubKey, sign }
-// Signed: hashcontent = [taskId, creatorFloId, trackId, time].join("|")
-// Only the creator who claimed the task can complete it - enforced by
-// checking fulfilled_by_flo_id against the (signature-verified) caller,
-// not just trusting the body.
-app.post(
-  "/api/tasks/:taskId/complete",
-  rateLimit({ max: 10, windowMs: 60000 }),
-  verifyFloSignature(["taskId", "creatorFloId", "trackId", "time"], {
-    floIdField: "creatorFloId",
-  }),
-  async (req, res) => {
-    const taskId = parsePositiveInt(req.params.taskId);
-    const { creatorFloId, trackId } = req.body;
-
-    if (!taskId) {
-      return res.status(400).json({ success: false, error: "Invalid taskId" });
-    }
-    if (!trackId) {
-      return res.status(400).json({ success: false, error: "Missing trackId" });
-    }
-
-    const client = await pool.connect();
-    try {
-      await client.query("BEGIN");
-
-      const task = await client.query(
-        "SELECT * FROM tasks WHERE id = $1 FOR UPDATE",
-        [taskId],
-      );
-      if (!task.rows.length) {
-        await client.query("ROLLBACK");
-        return res
-          .status(404)
-          .json({ success: false, error: "Task not found" });
-      }
-      const current = task.rows[0];
-      if (current.status !== "claimed") {
-        await client.query("ROLLBACK");
-        return res
-          .status(409)
-          .json({ success: false, error: "Task is not claimed" });
-      }
-      if (current.fulfilled_by_flo_id !== creatorFloId) {
-        await client.query("ROLLBACK");
-        return res.status(403).json({
-          success: false,
-          error: "Not the creator who claimed this task",
-        });
-      }
-
-      const updated = await client.query(
-        `UPDATE tasks
-         SET status = 'completed', track_id = $1, completed_at = now()
-         WHERE id = $2
-         RETURNING *`,
-        [trackId, taskId],
-      );
-
-      await client.query("COMMIT");
-      res.json({ success: true, task: updated.rows[0] });
-    } catch (err) {
-      await client.query("ROLLBACK");
-      console.error(err);
-      res.status(500).json({ success: false, error: "Database error" });
-    } finally {
-      client.release();
-    }
-  },
-);
-
-// POST /api/admin/whoami  { floId, time, pubKey, sign }
-// Signed: hashcontent = [floId, time].join("|")
-// Lets the frontend know whether the verified caller is an admin, so it
-// can hide admin-only controls (post task, add category, etc.) entirely
-// instead of showing them to everyone and 403ing on submit.
 app.post(
   "/api/admin/whoami",
-  verifyFloSignature(["floId", "time"]),
+  secureEndpoint({
+    fields: ["floId", "time"],
+    rateLimitOpts: { max: 20, windowMs: 60000 },
+  }),
   (req, res) => {
     const { floId } = req.body;
     res.json({ success: true, isAdmin: ADMIN_FLO_IDS.includes(floId) });
   },
 );
 
-// Manually trigger the marketplace pipeline. Admin-only.
-// { adminFloId, time, pubKey, sign }
+app.post(
+  "/api/admin/pipeline-status",
+  secureEndpoint({
+    fields: ["adminFloId", "time"],
+    floIdField: "adminFloId",
+    requireAdmin: true,
+    rateLimitOpts: { max: 5, windowMs: 60000 },
+  }),
+  async (req, res) => {
+    res.json({
+      success: true,
+      running: pipelineRunning,
+      startedAt: pipelineStartTime
+        ? new Date(pipelineStartTime).toISOString()
+        : null,
+      lockTime: pipelineLockTime
+        ? new Date(pipelineLockTime).toISOString()
+        : null,
+    });
+  },
+);
+
 app.post(
   "/api/marketplace/run-pipeline",
-  verifyFloSignature(["adminFloId", "time"], { floIdField: "adminFloId" }),
-  requireAdmin("adminFloId"),
+  secureEndpoint({
+    fields: ["adminFloId", "time"],
+    floIdField: "adminFloId",
+    requireAdmin: true,
+    rateLimitOpts: { max: 2, windowMs: 60000 },
+  }),
   async (req, res) => {
     try {
-      await runMarketplacePipeline();
-      res.json({ success: true });
+      setImmediate(() => runMarketplacePipeline());
+      await logAuditEvent("pipeline_manual_trigger", {
+        floId: req.verifiedFloId,
+        ip: req.ip,
+      });
+      res.json({ success: true, message: "Pipeline triggered" });
     } catch (err) {
       console.error(err);
-      res.status(500).json({ success: false, error: "Pipeline run failed" });
+      res
+        .status(500)
+        .json({ success: false, error: "Pipeline trigger failed" });
     }
   },
 );
 
-// Start the server
-console.log("Starting MusicMarketplace Oracle...");
-
-app.listen(port, () => {
-  console.log(`MusicMarketplace Oracle listening on port ${port}`);
-});
+// =====================================================================
+// SHUTDOWN
+// =====================================================================
 
 async function shutdown() {
   console.log("Closing PostgreSQL pool...");
-
   clearInterval(cacheCleanupInterval);
   clearInterval(marketplacePipelineInterval);
-
   await pool.end();
-
   console.log("PostgreSQL pool closed.");
-
   process.exit(0);
 }
 
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
 
-// Safety nets: log and exit cleanly instead of an unhandled rejection or
-// exception silently killing the process (or worse, leaving it running in
-// an unknown state).
 process.on("unhandledRejection", (reason) => {
   console.error("Unhandled promise rejection:", reason);
 });
@@ -3671,4 +4394,9 @@ process.on("unhandledRejection", (reason) => {
 process.on("uncaughtException", (err) => {
   console.error("Uncaught exception, shutting down:", err);
   shutdown();
+});
+
+console.log("Starting MusicMarketplace Oracle...");
+app.listen(port, () => {
+  console.log(`MusicMarketplace Oracle listening on port ${port}`);
 });

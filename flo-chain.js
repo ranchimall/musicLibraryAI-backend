@@ -1,5 +1,5 @@
-// Loads floBlockchainAPI.js under Node and exposes payment verify/send
-// helpers for the marketplace buy/sell endpoints.
+// Loads floBlockchainAPI.js under Node and exposes helpers for
+// verifying and sending FLO and USDAI marketplace payments.
 //
 // floBlockchainAPI.js is a browser bundle - it expects a global
 // `floGlobals` config object and a global `floCrypto` to already exist
