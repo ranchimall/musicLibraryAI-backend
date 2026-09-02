@@ -4371,6 +4371,34 @@ app.post(
   },
 );
 
+// Proxy Suno page to extract metadata (title, artist, image, lyrics, etc.)
+app.get("/api/suno-page-proxy", async (req, res) => {
+  const url = req.query.url;
+  if (!url) return res.status(400).send("Missing url");
+
+  try {
+    // Fetch the Suno page
+    const response = await fetch(url, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+      },
+      signal: AbortSignal.timeout(10000),
+    });
+
+    if (!response.ok) {
+      return res.status(response.status).send(`Failed to fetch: ${response.status}`);
+    }
+
+    const html = await response.text();
+    res.setHeader("Content-Type", "text/html");
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.send(html);
+  } catch (err) {
+    console.error("Suno page proxy error:", err);
+    res.status(500).send(`Proxy error: ${err.message}`);
+  }
+});
+
 // =====================================================================
 // SHUTDOWN
 // =====================================================================
