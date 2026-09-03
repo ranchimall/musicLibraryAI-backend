@@ -1196,40 +1196,47 @@ app.get("/api/platform-plays", async (req, res) => {
 });
 
 // POST /api/platform-plays
-app.post("/api/platform-plays", async (req, res) => {
-  const trackId = req.query.id;
+app.post(
+  "/api/platform-plays",
+  secureEndpoint({
+    fields: ["trackId", "floId", "time"],
+    rateLimitOpts: { max: 20, windowMs: 60000 },
+  }),
+  async (req, res) => {
+    const { trackId } = req.body;
 
-  if (!trackId || !trackId.trim()) {
-    return res.status(400).json({
-      success: false,
-      error: "Missing track id",
-    });
-  }
+    if (!trackId || !trackId.trim()) {
+      return res.status(400).json({
+        success: false,
+        error: "Missing track id",
+      });
+    }
 
-  try {
-    const result = await pool.query(
-      `
-      INSERT INTO plays (track_id, play_count)
-      VALUES ($1, 1)
-      ON CONFLICT (track_id)
-      DO UPDATE SET play_count = plays.play_count + 1
-      RETURNING play_count
-      `,
-      [trackId],
-    );
+    try {
+      const result = await pool.query(
+        `
+        INSERT INTO plays (track_id, play_count)
+        VALUES ($1, 1)
+        ON CONFLICT (track_id)
+        DO UPDATE SET play_count = plays.play_count + 1
+        RETURNING play_count
+        `,
+        [trackId],
+      );
 
-    res.json({
-      success: true,
-      playCount: result.rows[0].play_count,
-    });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({
-      success: false,
-      error: "Database error",
-    });
-  }
-});
+      res.json({
+        success: true,
+        playCount: result.rows[0].play_count,
+      });
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({
+        success: false,
+        error: "Database error",
+      });
+    }
+  },
+);
 
 app.get("/api/likes", async (req, res) => {
   const trackId = req.query.id;
@@ -1264,6 +1271,88 @@ app.get("/api/likes", async (req, res) => {
     });
   }
 });
+
+app.post(
+  "/api/likes",
+  secureEndpoint({
+    fields: ["trackId", "floId", "time"],
+    rateLimitOpts: { max: 20, windowMs: 60000 },
+  }),
+  async (req, res) => {
+    const { trackId, floId } = req.body;
+
+    if (!trackId || !floId) {
+      return res.status(400).json({
+        success: false,
+        error: "Missing trackId or floId",
+      });
+    }
+
+    const client = await pool.connect();
+
+    try {
+      await client.query("BEGIN");
+
+      await client.query(
+        `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`,
+        [`${trackId}:${floId}`],
+      );
+
+      const existing = await client.query(
+        `SELECT 1
+         FROM likes
+         WHERE track_id = $1 AND user_id = $2`,
+        [trackId, floId],
+      );
+
+      let liked;
+
+      if (existing.rowCount > 0) {
+        await client.query(
+          `DELETE FROM likes
+           WHERE track_id = $1 AND user_id = $2`,
+          [trackId, floId],
+        );
+
+        liked = false;
+      } else {
+        await client.query(
+          `INSERT INTO likes (track_id, user_id)
+           VALUES ($1, $2)`,
+          [trackId, floId],
+        );
+
+        liked = true;
+      }
+
+      const countResult = await client.query(
+        `SELECT COUNT(*)::int AS like_count
+         FROM likes
+         WHERE track_id = $1`,
+        [trackId],
+      );
+
+      await client.query("COMMIT");
+
+      return res.json({
+        success: true,
+        liked,
+        likeCount: countResult.rows[0].like_count,
+      });
+    } catch (err) {
+      await client.query("ROLLBACK").catch(() => {});
+
+      console.error("Failed to toggle track like:", err);
+
+      return res.status(500).json({
+        success: false,
+        error: "Database error",
+      });
+    } finally {
+      client.release();
+    }
+  },
+);
 
 app.get("/api/liked-tracks", async (req, res) => {
   const userId = req.query.user;
@@ -4380,13 +4469,16 @@ app.get("/api/suno-page-proxy", async (req, res) => {
     // Fetch the Suno page
     const response = await fetch(url, {
       headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
       },
       signal: AbortSignal.timeout(10000),
     });
 
     if (!response.ok) {
-      return res.status(response.status).send(`Failed to fetch: ${response.status}`);
+      return res
+        .status(response.status)
+        .send(`Failed to fetch: ${response.status}`);
     }
 
     const html = await response.text();
