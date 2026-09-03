@@ -3226,22 +3226,23 @@ app.get("/api/properties/:propertyId", async (req, res) => {
         .json({ success: false, error: "Property not found" });
     }
 
-    const [components, people, finance, tasks] = await Promise.all([
-      pool.query(
-        `SELECT tc.* FROM property_components pc
+    const [components, people, finance, tasks, usageEvents] = await Promise.all(
+      [
+        pool.query(
+          `SELECT tc.* FROM property_components pc
          JOIN tracks_components tc ON tc.id = pc.component_id
          WHERE pc.property_id = $1`,
-        [propertyId],
-      ),
-      pool.query(
-        `SELECT pe.*, pp.role
+          [propertyId],
+        ),
+        pool.query(
+          `SELECT pe.*, pp.role
          FROM property_people pp
          JOIN people pe ON pe.flo_id = pp.person_flo_id
          WHERE pp.property_id = $1`,
-        [propertyId],
-      ),
-      pool.query(
-        `SELECT fc.*,
+          [propertyId],
+        ),
+        pool.query(
+          `SELECT fc.*,
           COALESCE(
             json_agg(
               json_build_object(
@@ -3258,16 +3259,21 @@ app.get("/api/properties/:propertyId", async (req, res) => {
          WHERE fc.property_id = $1
          GROUP BY fc.id
          ORDER BY fc.created_at DESC`,
-        [propertyId],
-      ),
-      pool.query(
-        `SELECT t.*
+          [propertyId],
+        ),
+        pool.query(
+          `SELECT t.*
          FROM property_tasks pt
          JOIN tasks t ON t.id = pt.task_id
          WHERE pt.property_id = $1`,
-        [propertyId],
-      ),
-    ]);
+          [propertyId],
+        ),
+        pool.query(
+          `SELECT * FROM property_usage_events WHERE property_id = $1 ORDER BY created_at DESC`,
+          [propertyId],
+        ),
+      ],
+    );
 
     res.json({
       success: true,
@@ -3276,6 +3282,7 @@ app.get("/api/properties/:propertyId", async (req, res) => {
       people: people.rows,
       finance: finance.rows,
       tasks: tasks.rows,
+      usageEvents: usageEvents.rows,
     });
   } catch (err) {
     console.error(err);
@@ -4396,6 +4403,26 @@ app.post(
     }
   },
 );
+
+// =====================================================================
+// API: GET USAGE EVENTS
+// =====================================================================
+
+app.get("/api/properties/:propertyId/usage-events", async (req, res) => {
+  const { propertyId } = req.params;
+
+  try {
+    const result = await pool.query(
+      `SELECT * FROM property_usage_events WHERE property_id = $1 ORDER BY created_at DESC`,
+      [propertyId],
+    );
+
+    res.json({ success: true, events: result.rows });
+  } catch (err) {
+    console.error("Failed to fetch usage events:", err);
+    res.status(500).json({ success: false, error: "Database error" });
+  }
+});
 
 // =====================================================================
 // API: ADMIN
