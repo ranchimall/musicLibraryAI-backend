@@ -4425,6 +4425,38 @@ app.get("/api/properties/:propertyId/usage-events", async (req, res) => {
 });
 
 // =====================================================================
+// API: DELETE USAGE EVENT
+// =====================================================================
+
+app.post(
+  "/api/properties/:propertyId/usage-events/:eventId",
+  secureEndpoint({
+    fields: ["propertyId", "eventId", "adminFloId", "time"],
+    floIdField: "adminFloId",
+    requireAdmin: true,
+    rateLimitOpts: { max: 10, windowMs: 60000 },
+  }),
+  async (req, res) => {
+    const { propertyId, eventId } = req.params;
+    try {
+      const result = await pool.query(
+        "DELETE FROM property_usage_events WHERE id = $1 AND property_id = $2 RETURNING id",
+        [eventId, propertyId]
+      );
+      if (!result.rows.length) {
+        return res.status(404).json({ success: false, error: "Usage event not found" });
+      }
+      await logAuditEvent("usage_event_deleted", {
+        floId: req.verifiedFloId, propertyId, eventId, ip: req.ip
+      });
+      res.json({ success: true });
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ success: false, error: "Database error" });
+    }
+  }
+);
+// =====================================================================
 // API: ADMIN
 // =====================================================================
 
