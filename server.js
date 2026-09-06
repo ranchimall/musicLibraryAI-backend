@@ -873,6 +873,16 @@ async function ensureMarketplaceSchema() {
   `);
 
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS task_claims (
+      id SERIAL PRIMARY KEY,
+      task_id INT REFERENCES tasks(id) NOT NULL,
+      claimer_flo_id TEXT NOT NULL,
+      claimed_at TIMESTAMPTZ DEFAULT now(),
+      UNIQUE(task_id, claimer_flo_id)
+    );
+  `);
+
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS property_tasks (
       property_id INT REFERENCES properties(id),
       task_id     INT REFERENCES tasks(id),
@@ -3656,10 +3666,24 @@ app.get("/api/properties/:propertyId/finance-allocations", async (req, res) => {
 
 app.get("/api/tasks", async (req, res) => {
   try {
-    const result = await pool.query(
-      "SELECT * FROM tasks ORDER BY created_at DESC",
+    const [tasks, claims, winners] = await Promise.all([
+      pool.query("SELECT * FROM tasks ORDER BY created_at DESC"),
+      pool.query("SELECT * FROM task_claims ORDER BY claimed_at DESC"),
+      pool.query(
+        "SELECT task_id, submitter_flo_id FROM task_submissions WHERE is_selected = true",
+      ),
+    ]);
+
+    const winnerByTaskId = new Map(
+      winners.rows.map((row) => [String(row.task_id), row.submitter_flo_id]),
     );
-    res.json({ success: true, tasks: result.rows });
+
+    const tasksWithWinners = tasks.rows.map((task) => ({
+      ...task,
+      winner_flo_id: winnerByTaskId.get(String(task.id)) || null,
+    }));
+
+    res.json({ success: true, tasks: tasksWithWinners, claims: claims.rows });
   } catch (err) {
     console.error(err);
     res.status(500).json({ success: false, error: "Database error" });
@@ -3756,12 +3780,22 @@ app.post(
           .json({ success: false, error: "Task is not open" });
       }
 
-      const updated = await client.query(
-        `UPDATE tasks
-         SET status = 'claimed', fulfilled_by_flo_id = $1, claimed_at = now()
-         WHERE id = $2
-         RETURNING *`,
-        [creatorFloId, taskId],
+      const existingClaim = await client.query(
+        "SELECT 1 FROM task_claims WHERE task_id = $1 AND claimer_flo_id = $2",
+        [taskId, creatorFloId],
+      );
+
+      if (existingClaim.rows.length) {
+        await client.query("ROLLBACK");
+        return res.status(409).json({
+          success: false,
+          error: "You have already claimed this task.",
+        });
+      }
+
+      await client.query(
+        "INSERT INTO task_claims (task_id, claimer_flo_id) VALUES ($1, $2)",
+        [taskId, creatorFloId],
       );
 
       await client.query("COMMIT");
@@ -3770,80 +3804,7 @@ app.post(
         taskId,
         ip: req.ip,
       });
-      res.json({ success: true, task: updated.rows[0] });
-    } catch (err) {
-      await client.query("ROLLBACK");
-      console.error(err);
-      res.status(500).json({ success: false, error: "Database error" });
-    } finally {
-      client.release();
-    }
-  },
-);
-
-app.post(
-  "/api/tasks/:taskId/complete",
-  secureEndpoint({
-    fields: ["taskId", "creatorFloId", "trackId", "time"],
-    floIdField: "creatorFloId",
-    rateLimitOpts: { max: 10, windowMs: 60000 },
-  }),
-  async (req, res) => {
-    const taskId = parsePositiveInt(req.params.taskId);
-    const { creatorFloId, trackId } = req.body;
-
-    if (!taskId) {
-      return res.status(400).json({ success: false, error: "Invalid taskId" });
-    }
-    if (!trackId) {
-      return res.status(400).json({ success: false, error: "Missing trackId" });
-    }
-
-    const client = await pool.connect();
-    try {
-      await client.query("BEGIN");
-
-      const task = await client.query(
-        "SELECT * FROM tasks WHERE id = $1 FOR UPDATE",
-        [taskId],
-      );
-      if (!task.rows.length) {
-        await client.query("ROLLBACK");
-        return res
-          .status(404)
-          .json({ success: false, error: "Task not found" });
-      }
-      const current = task.rows[0];
-      if (current.status !== "claimed") {
-        await client.query("ROLLBACK");
-        return res
-          .status(409)
-          .json({ success: false, error: "Task is not claimed" });
-      }
-      if (current.fulfilled_by_flo_id !== creatorFloId) {
-        await client.query("ROLLBACK");
-        return res.status(403).json({
-          success: false,
-          error: "Not the creator who claimed this task",
-        });
-      }
-
-      const updated = await client.query(
-        `UPDATE tasks
-         SET status = 'completed', track_id = $1, completed_at = now()
-         WHERE id = $2
-         RETURNING *`,
-        [trackId, taskId],
-      );
-
-      await client.query("COMMIT");
-      await logAuditEvent("task_completed", {
-        floId: creatorFloId,
-        taskId,
-        trackId,
-        ip: req.ip,
-      });
-      res.json({ success: true, task: updated.rows[0] });
+      res.json({ success: true, message: "Task claimed." });
     } catch (err) {
       await client.query("ROLLBACK");
       console.error(err);
@@ -3885,14 +3846,17 @@ app.post(
           .status(404)
           .json({ success: false, error: "Task not found" });
       }
-      if (
-        task.rows[0].status !== "claimed" ||
-        task.rows[0].fulfilled_by_flo_id !== creatorFloId
-      ) {
+
+      const claimCheck = await client.query(
+        "SELECT 1 FROM task_claims WHERE task_id = $1 AND claimer_flo_id = $2",
+        [taskId, creatorFloId],
+      );
+
+      if (!claimCheck.rows.length) {
         await client.query("ROLLBACK");
         return res
           .status(403)
-          .json({ success: false, error: "Task is not claimed by you" });
+          .json({ success: false, error: "You have not claimed this task." });
       }
 
       const insert = await client.query(
@@ -3990,6 +3954,24 @@ app.post(
     }
   },
 );
+
+// GET: Fetch all submissions for a specific task (for the Task Giver/Admin)
+app.get("/api/tasks/:taskId/submissions", async (req, res) => {
+  const taskId = parsePositiveInt(req.params.taskId);
+  if (!taskId)
+    return res.status(400).json({ success: false, error: "Invalid taskId" });
+
+  try {
+    const result = await pool.query(
+      "SELECT * FROM task_submissions WHERE task_id = $1 ORDER BY created_at DESC",
+      [taskId],
+    );
+    res.json({ success: true, submissions: result.rows });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ success: false, error: "Database error" });
+  }
+});
 
 app.post(
   "/api/properties/:propertyId/tasks",
@@ -4592,20 +4574,25 @@ app.post(
     try {
       const result = await pool.query(
         "DELETE FROM property_usage_events WHERE id = $1 AND property_id = $2 RETURNING id",
-        [eventId, propertyId]
+        [eventId, propertyId],
       );
       if (!result.rows.length) {
-        return res.status(404).json({ success: false, error: "Usage event not found" });
+        return res
+          .status(404)
+          .json({ success: false, error: "Usage event not found" });
       }
       await logAuditEvent("usage_event_deleted", {
-        floId: req.verifiedFloId, propertyId, eventId, ip: req.ip
+        floId: req.verifiedFloId,
+        propertyId,
+        eventId,
+        ip: req.ip,
       });
       res.json({ success: true });
     } catch (err) {
       console.error(err);
       res.status(500).json({ success: false, error: "Database error" });
     }
-  }
+  },
 );
 // =====================================================================
 // API: ADMIN
