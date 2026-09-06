@@ -2910,6 +2910,48 @@ app.get("/api/categories", async (req, res) => {
   }
 });
 
+// =====================================================================
+// API: MARKETPLACE OVERVIEW (Unified Views)
+// =====================================================================
+
+app.get("/api/marketplace/overview", async (req, res) => {
+  try {
+    const [people, finance, marketing] = await Promise.all([
+      pool.query(`
+        SELECT p.*, pp.property_id, pr.name AS property_name, pp.role
+        FROM people p
+        LEFT JOIN property_people pp ON p.flo_id = pp.person_flo_id
+        LEFT JOIN properties pr ON pp.property_id = pr.id
+        ORDER BY p.flo_id
+      `),
+      pool.query(`
+        SELECT fc.*, pr.name AS property_name
+        FROM finance_components fc
+        LEFT JOIN properties pr ON fc.property_id = pr.id
+        ORDER BY fc.created_at DESC
+      `),
+      pool.query(`
+        SELECT tc.*, pr.name AS property_name, pc.property_id
+        FROM tracks_components tc
+        LEFT JOIN property_components pc ON tc.id = pc.component_id
+        LEFT JOIN properties pr ON pc.property_id = pr.id
+        WHERE tc.component_type = 'marketing'
+        ORDER BY tc.created_at DESC
+      `),
+    ]);
+
+    res.json({
+      success: true,
+      people: people.rows,
+      finance: finance.rows,
+      marketing: marketing.rows,
+    });
+  } catch (err) {
+    console.error("Failed to fetch overview:", err);
+    res.status(500).json({ success: false, error: "Database error" });
+  }
+});
+
 app.post(
   "/api/categories",
   secureEndpoint({
