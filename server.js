@@ -857,6 +857,20 @@ async function ensureMarketplaceSchema() {
   await pool.query(
     `ALTER TABLE tasks ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ;`,
   );
+  await pool.query(
+    `ALTER TABLE tasks ADD COLUMN IF NOT EXISTS delivery_link TEXT;`,
+  );
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS task_submissions (
+      id SERIAL PRIMARY KEY,
+      task_id INT REFERENCES tasks(id) NOT NULL,
+      submitter_flo_id TEXT NOT NULL,
+      delivery_link TEXT NOT NULL,
+      is_selected BOOLEAN DEFAULT false,
+      created_at TIMESTAMPTZ DEFAULT now()
+    );
+  `);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS property_tasks (
@@ -3830,6 +3844,143 @@ app.post(
         ip: req.ip,
       });
       res.json({ success: true, task: updated.rows[0] });
+    } catch (err) {
+      await client.query("ROLLBACK");
+      console.error(err);
+      res.status(500).json({ success: false, error: "Database error" });
+    } finally {
+      client.release();
+    }
+  },
+);
+
+app.post(
+  "/api/tasks/:taskId/submit",
+  secureEndpoint({
+    fields: ["taskId", "creatorFloId", "deliveryLink", "time"],
+    floIdField: "creatorFloId",
+    rateLimitOpts: { max: 10, windowMs: 60000 },
+  }),
+  async (req, res) => {
+    const taskId = parsePositiveInt(req.params.taskId);
+    const { creatorFloId, deliveryLink } = req.body;
+
+    if (!taskId || !deliveryLink) {
+      return res
+        .status(400)
+        .json({ success: false, error: "Missing taskId or deliveryLink" });
+    }
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+
+      const task = await client.query(
+        "SELECT * FROM tasks WHERE id = $1 FOR UPDATE",
+        [taskId],
+      );
+      if (!task.rows.length) {
+        await client.query("ROLLBACK");
+        return res
+          .status(404)
+          .json({ success: false, error: "Task not found" });
+      }
+      if (
+        task.rows[0].status !== "claimed" ||
+        task.rows[0].fulfilled_by_flo_id !== creatorFloId
+      ) {
+        await client.query("ROLLBACK");
+        return res
+          .status(403)
+          .json({ success: false, error: "Task is not claimed by you" });
+      }
+
+      const insert = await client.query(
+        `INSERT INTO task_submissions (task_id, submitter_flo_id, delivery_link)
+         VALUES ($1, $2, $3) RETURNING *`,
+        [taskId, creatorFloId, deliveryLink],
+      );
+
+      await client.query("COMMIT");
+      await logAuditEvent("task_submission_created", {
+        floId: creatorFloId,
+        taskId,
+        deliveryLink,
+        ip: req.ip,
+      });
+      res.json({ success: true, submission: insert.rows[0] });
+    } catch (err) {
+      await client.query("ROLLBACK");
+      console.error(err);
+      res.status(500).json({ success: false, error: "Database error" });
+    } finally {
+      client.release();
+    }
+  },
+);
+
+app.post(
+  "/api/tasks/:taskId/select-winner",
+  secureEndpoint({
+    fields: ["taskId", "submissionId", "adminFloId", "time"],
+    floIdField: "adminFloId",
+    requireAdmin: true,
+    rateLimitOpts: { max: 10, windowMs: 60000 },
+  }),
+  async (req, res) => {
+    const taskId = parsePositiveInt(req.params.taskId);
+    const { submissionId } = req.body;
+
+    if (!taskId || !submissionId) {
+      return res
+        .status(400)
+        .json({ success: false, error: "Missing taskId or submissionId" });
+    }
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+
+      await client.query(
+        `UPDATE task_submissions SET is_selected = false WHERE task_id = $1`,
+        [taskId],
+      );
+
+      const submission = await client.query(
+        `UPDATE task_submissions
+         SET is_selected = true
+         WHERE id = $1 AND task_id = $2
+         RETURNING *`,
+        [submissionId, taskId],
+      );
+
+      if (!submission.rows.length) {
+        await client.query("ROLLBACK");
+        return res
+          .status(404)
+          .json({ success: false, error: "Submission not found" });
+      }
+
+      const updatedTask = await client.query(
+        `UPDATE tasks
+         SET status = 'completed', completed_at = now()
+         WHERE id = $1
+         RETURNING *`,
+        [taskId],
+      );
+
+      await client.query("COMMIT");
+      await logAuditEvent("task_submission_selected", {
+        floId: req.verifiedFloId,
+        taskId,
+        submissionId,
+        ip: req.ip,
+      });
+      res.json({
+        success: true,
+        task: updatedTask.rows[0],
+        selected_submission: submission.rows[0],
+      });
     } catch (err) {
       await client.query("ROLLBACK");
       console.error(err);
