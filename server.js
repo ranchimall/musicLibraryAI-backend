@@ -946,7 +946,19 @@ async function ensureMarketplaceSchema() {
     ON property_finance_allocations (category);
   `);
 
-  console.log("Marketplace v3 schema ready (bundle properties)");
+    await pool.query(
+    `ALTER TABLE people ADD COLUMN IF NOT EXISTS profile_image_url TEXT;`,
+  );
+  await pool.query(
+    `ALTER TABLE people ADD COLUMN IF NOT EXISTS x_url TEXT;`,
+  );
+  await pool.query(
+    `ALTER TABLE people ADD COLUMN IF NOT EXISTS linkedin_url TEXT;`,
+  );
+  await pool.query(
+    `ALTER TABLE people ADD COLUMN IF NOT EXISTS website_url TEXT;`,
+  );
+  console.log("Marketplace v3 schema ready");
 }
 
 async function ensureAuditLogSchema() {
@@ -3138,11 +3150,32 @@ app.get("/api/main-token/payment-address", (req, res) => {
 app.post(
   "/api/people",
   secureEndpoint({
-    fields: ["floId", "workProfile", "time"],
+    fields: [
+      "floId",
+      "workProfile",
+      "experience",
+      "name",
+      "cvUrl",
+      "profileImageUrl",
+      "xUrl",
+      "linkedinUrl",
+      "websiteUrl",
+      "time",
+    ],
     rateLimitOpts: { max: 10, windowMs: 60000 },
   }),
   async (req, res) => {
-    const { floId, workProfile, experience, name, cvUrl } = req.body;
+    const {
+      floId,
+      workProfile,
+      experience,
+      name,
+      cvUrl,
+      profileImageUrl,
+      xUrl,
+      linkedinUrl,
+      websiteUrl,
+    } = req.body;
 
     if (!floId || !workProfile) {
       return res.status(400).json({
@@ -3153,16 +3186,40 @@ app.post(
 
     try {
       const result = await pool.query(
-        `INSERT INTO people (flo_id, work_profile, experience, name, cv_url)
-         VALUES ($1, $2, $3, $4, $5)
+        `INSERT INTO people (
+           flo_id,
+           work_profile,
+           experience,
+           name,
+           cv_url,
+           profile_image_url,
+           x_url,
+           linkedin_url,
+           website_url
+         )
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
          ON CONFLICT (flo_id) DO UPDATE SET
-           work_profile = EXCLUDED.work_profile,
-           experience   = EXCLUDED.experience,
-           name         = EXCLUDED.name,
-           cv_url       = EXCLUDED.cv_url,
-           updated_at   = now()
+           work_profile      = EXCLUDED.work_profile,
+           experience        = EXCLUDED.experience,
+           name              = EXCLUDED.name,
+           cv_url            = EXCLUDED.cv_url,
+           profile_image_url = EXCLUDED.profile_image_url,
+           x_url             = EXCLUDED.x_url,
+           linkedin_url      = EXCLUDED.linkedin_url,
+           website_url       = EXCLUDED.website_url,
+           updated_at        = now()
          RETURNING *`,
-        [floId, workProfile, experience || null, name || null, cvUrl || null],
+        [
+          floId,
+          workProfile,
+          experience || null,
+          name || null,
+          cvUrl || null,
+          profileImageUrl || null,
+          xUrl || null,
+          linkedinUrl || null,
+          websiteUrl || null,
+        ],
       );
       await logAuditEvent("person_created", {
         floId,
@@ -3179,13 +3236,17 @@ app.post(
 
 app.get("/api/people/:floId", async (req, res) => {
   try {
-    const result = await pool.query("SELECT * FROM people WHERE flo_id = $1", [
-      req.params.floId,
-    ]);
+    const result = await pool.query(`
+      SELECT p.*,
+        (SELECT COUNT(DISTINCT pp.property_id) FROM property_people pp WHERE pp.person_flo_id = p.flo_id) AS property_count,
+        (SELECT COUNT(*) FROM tracks_components tc WHERE tc.contributor_flo_id = p.flo_id) AS component_count,
+        (SELECT COUNT(DISTINCT ts.task_id) FROM task_submissions ts WHERE ts.submitter_flo_id = p.flo_id AND ts.is_selected = true) AS task_count
+      FROM people p 
+      WHERE p.flo_id = $1
+    `, [req.params.floId]);
+    
     if (!result.rows.length) {
-      return res
-        .status(404)
-        .json({ success: false, error: "Person not found" });
+      return res.status(404).json({ success: false, error: "Person not found" });
     }
     res.json({ success: true, person: result.rows[0] });
   } catch (err) {
