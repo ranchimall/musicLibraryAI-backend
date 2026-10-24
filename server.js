@@ -1,5 +1,6 @@
 const express = require("express");
 const cors = require("cors");
+const crypto = require("crypto");
 const { Pool } = require("pg");
 require("dotenv").config();
 const { verifyFloSignature, rateLimitAuth } = require("./flo-auth");
@@ -9,6 +10,16 @@ const {
   sendUsdaiPayment,
   MARKETPLACE_FLO_ADDRESS,
 } = require("./flo-chain");
+const {
+  DEFAULT_MARKETPLACE_CONFIG,
+  CONFIG_KEYS,
+  normalizeConfigValue,
+  normalizeMarketplaceConfig,
+  computeConsumption,
+  computeBasePrice,
+  computeConsumptionShares,
+  buildFormulaDescription,
+} = require("./marketplace-formulas");
 
 // Fail fast if the DB isn't configured
 if (!process.env.DATABASE_URL) {
@@ -22,6 +33,7 @@ const sunoCache = new Map();
 const flowCache = new Map();
 const top100Cache = new Map();
 const playTracking = new Map();
+const sunoResolveCache = new Map();
 const CACHE_DURATION = 5 * 60 * 1000;
 const MAX_CACHE_ENTRIES = 2000;
 
@@ -158,6 +170,12 @@ const cacheCleanupInterval = setInterval(() => {
     }
   }
 
+  for (const [key, entry] of sunoResolveCache.entries()) {
+    if (now - entry.timestamp > CACHE_DURATION) {
+      sunoResolveCache.delete(key);
+    }
+  }
+
   for (const [key, entry] of top100Cache.entries()) {
     if (now - entry.timestamp > 60000) {
       top100Cache.delete(key);
@@ -227,6 +245,9 @@ pool
     console.log("Connected to Neon PostgreSQL");
     client.release();
     await ensureMarketplaceSchema();
+    await ensureConfigSchema();
+    await loadMarketplaceConfig();
+    await backfillSellQueueExpiry();
     await ensureAuditLogSchema();
     await ensureLifecycleSchema();
     await ensureComponentSchema();
@@ -661,6 +682,43 @@ async function ensureMarketplaceSchema() {
   await pool.query(
     `ALTER TABLE properties ADD COLUMN IF NOT EXISTS in_global_top_100 BOOLEAN DEFAULT false;`,
   );
+  await pool.query(
+    `ALTER TABLE properties ADD COLUMN IF NOT EXISTS admin_score NUMERIC DEFAULT 0;`,
+  );
+  await pool.query(
+    `ALTER TABLE properties ADD COLUMN IF NOT EXISTS admin_score_reason TEXT;`,
+  );
+  await pool.query(
+    `ALTER TABLE properties ADD COLUMN IF NOT EXISTS admin_score_updated_at TIMESTAMPTZ;`,
+  );
+  await pool.query(
+    `ALTER TABLE properties ADD COLUMN IF NOT EXISTS is_bundle BOOLEAN DEFAULT false;`,
+  );
+  await pool.query(
+    `ALTER TABLE properties ADD COLUMN IF NOT EXISTS bundle_key TEXT;`,
+  );
+  await pool.query(
+    `ALTER TABLE properties ADD COLUMN IF NOT EXISTS bundled_into_property_id INT REFERENCES properties(id) ON DELETE SET NULL;`,
+  );
+  await pool.query(
+    `ALTER TABLE properties ADD COLUMN IF NOT EXISTS bundle_member_count INT DEFAULT 0;`,
+  );
+  await pool.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_properties_bundle_key
+    ON properties (bundle_key) WHERE bundle_key IS NOT NULL;
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS property_bundle_members (
+      bundle_property_id INT REFERENCES properties(id) ON DELETE CASCADE,
+      member_property_id INT REFERENCES properties(id) ON DELETE CASCADE,
+      added_at TIMESTAMPTZ DEFAULT now(),
+      PRIMARY KEY (bundle_property_id, member_property_id)
+    );
+  `);
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_property_bundle_members_member
+    ON property_bundle_members (member_property_id);
+  `);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS property_valuation_history (
@@ -749,6 +807,12 @@ async function ensureMarketplaceSchema() {
   await pool.query(
     `ALTER TABLE sell_queue ADD COLUMN IF NOT EXISTS payout_locked_at TIMESTAMPTZ;`,
   );
+  await pool.query(
+    `ALTER TABLE sell_queue ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;`,
+  );
+  await pool.query(
+    `ALTER TABLE sell_queue ADD COLUMN IF NOT EXISTS expired_at TIMESTAMPTZ;`,
+  );
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS property_payouts (
@@ -808,6 +872,59 @@ async function ensureMarketplaceSchema() {
       added_at        TIMESTAMPTZ DEFAULT now(),
       PRIMARY KEY (property_id, person_flo_id, role)
     );
+  `);
+  await pool.query(
+    `ALTER TABLE property_people ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'active';`,
+  );
+  await pool.query(
+    `ALTER TABLE property_people ADD COLUMN IF NOT EXISTS part TEXT DEFAULT 'people';`,
+  );
+  await pool.query(
+    `ALTER TABLE property_people ADD COLUMN IF NOT EXISTS joined_at TIMESTAMPTZ DEFAULT now();`,
+  );
+  await pool.query(
+    `ALTER TABLE property_people ADD COLUMN IF NOT EXISTS removed_at TIMESTAMPTZ;`,
+  );
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS property_invitations (
+      id                  SERIAL PRIMARY KEY,
+      property_id         INT REFERENCES properties(id) ON DELETE CASCADE NOT NULL,
+      inviter_flo_id      TEXT NOT NULL,
+      invitee_flo_id      TEXT NOT NULL,
+      part                TEXT NOT NULL DEFAULT 'people',
+      role                TEXT NOT NULL DEFAULT 'contributor',
+      token               TEXT UNIQUE NOT NULL,
+      status              TEXT NOT NULL DEFAULT 'pending',
+      read_at             TIMESTAMPTZ,
+      expires_at          TIMESTAMPTZ NOT NULL,
+      responded_at        TIMESTAMPTZ,
+      created_at          TIMESTAMPTZ DEFAULT now(),
+      updated_at          TIMESTAMPTZ DEFAULT now()
+    );
+  `);
+  await pool.query(
+    `ALTER TABLE property_invitations ADD COLUMN IF NOT EXISTS read_at TIMESTAMPTZ;`,
+  );
+  await pool.query(
+    `ALTER TABLE property_people ADD COLUMN IF NOT EXISTS invitation_id INT REFERENCES property_invitations(id) ON DELETE SET NULL;`,
+  );
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_property_invitations_property_status
+    ON property_invitations (property_id, status);
+  `);
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_property_invitations_invitee_status
+    ON property_invitations (invitee_flo_id, status);
+  `);
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_property_invitations_unread
+    ON property_invitations (invitee_flo_id)
+    WHERE status = 'pending' AND read_at IS NULL;
+  `);
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_property_people_property_status
+    ON property_people (property_id, status);
   `);
 
   await pool.query(`
@@ -946,7 +1063,7 @@ async function ensureMarketplaceSchema() {
     ON property_finance_allocations (category);
   `);
 
-    await pool.query(
+      await pool.query(
     `ALTER TABLE people ADD COLUMN IF NOT EXISTS profile_image_url TEXT;`,
   );
   await pool.query(
@@ -959,6 +1076,94 @@ async function ensureMarketplaceSchema() {
     `ALTER TABLE people ADD COLUMN IF NOT EXISTS website_url TEXT;`,
   );
   console.log("Marketplace v3 schema ready");
+}
+
+// =====================================================================
+// MARKETPLACE CONFIG
+// =====================================================================
+
+async function ensureConfigSchema() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS marketplace_config (
+      key             TEXT PRIMARY KEY,
+      value           JSONB NOT NULL,
+      description     TEXT,
+      updated_by_flo_id TEXT,
+      updated_at      TIMESTAMPTZ DEFAULT now()
+    );
+  `);
+
+  // Remove settings from the discarded unit-ratio mode.
+  await pool.query(
+    `DELETE FROM marketplace_config
+     WHERE key IN ('views_per_unit', 'persons_per_unit', 'consumption_mode')`,
+  );
+
+  for (const key of CONFIG_KEYS) {
+    const value = DEFAULT_MARKETPLACE_CONFIG[key];
+    await pool.query(
+      `INSERT INTO marketplace_config (key, value, description)
+       VALUES ($1, $2::jsonb, $3)
+       ON CONFLICT (key) DO NOTHING`,
+      [key, JSON.stringify(value), CONFIG_DESCRIPTIONS[key] || null],
+    );
+  }
+
+  console.log("Marketplace config schema ready");
+}
+
+async function loadMarketplaceConfig() {
+  try {
+    const result = await pool.query(
+      `SELECT key, value FROM marketplace_config`,
+    );
+    const raw = {};
+    for (const row of result.rows) {
+      raw[row.key] = row.value;
+    }
+    marketplaceConfig = normalizeMarketplaceConfig(raw);
+    console.log("Marketplace config loaded:", {
+      people_weight: marketplaceConfig.people_weight,
+      task_weight: marketplaceConfig.task_weight,
+      top_n_properties: marketplaceConfig.top_n_properties,
+      sell_queue_period_days: marketplaceConfig.sell_queue_period_days,
+      weak_bundle: marketplaceConfig.weak_bundle_enabled
+        ? `${marketplaceConfig.weak_bundle_size} properties`
+        : "off",
+    });
+    return marketplaceConfig;
+  } catch (err) {
+    console.error("Failed to load marketplace config:", err);
+    return marketplaceConfig;
+  }
+}
+
+function invitationToken() {
+  return crypto.randomBytes(INVITATION_TOKEN_BYTES).toString("hex");
+}
+
+function normalizeInvitationPart(part) {
+  const value = String(part || "people").trim().toLowerCase();
+  return INVITATION_PARTS.includes(value) ? value : null;
+}
+
+function defaultInvitationRole(part) {
+  if (part === "finance") return "finance";
+  if (part === "marketing") return "marketing";
+  if (part === "creative") return "creative";
+  return "contributor";
+}
+
+async function expireStaleInvitations(db = pool) {
+  const result = await db.query(
+    `UPDATE property_invitations
+     SET status = 'expired',
+         responded_at = now(),
+         updated_at = now()
+     WHERE status = 'pending' AND expires_at <= now()
+     RETURNING id`,
+  );
+  return result.rowCount;
 }
 
 async function ensureAuditLogSchema() {
@@ -1508,6 +1713,11 @@ const PROPERTY_COMPONENT_TYPES = [
 ];
 const ALL_COMPONENT_TYPES = [...PROPERTY_COMPONENT_TYPES];
 
+const INVITATION_PARTS = ["people", "creative", "finance", "marketing"];
+const DEFAULT_INVITATION_EXPIRY_DAYS = 7;
+const MAX_INVITATION_EXPIRY_DAYS = 90;
+const INVITATION_TOKEN_BYTES = 24;
+
 const COMPONENT_CATEGORIES = {
   CREATIVE: ["lyrics", "music", "vocals", "production"],
   BUSINESS: ["marketing", "distribution", "legal", "finance"],
@@ -1517,15 +1727,34 @@ const COMPONENT_CATEGORIES = {
 const PRICE_ALPHA = 0.15;
 const PRICE_BETA = 0.15;
 
-const PER_UNIT_VALUE = 1;
+let marketplaceConfig = normalizeMarketplaceConfig(DEFAULT_MARKETPLACE_CONFIG);
+
+function getTopN() {
+  const n = parseInt(marketplaceConfig.top_n_properties, 10);
+  return Number.isInteger(n) && n > 0 ? n : 100;
+}
+
+function getSellQueuePeriodDays() {
+  const days = Number(marketplaceConfig.sell_queue_period_days);
+  return Number.isFinite(days) && days > 0 ? days : 7;
+}
+
+const CONFIG_DESCRIPTIONS = {
+  sell_queue_period_days: "Days before an unpaid sell-queue request expires",
+  top_n_properties: "How many properties are included in the global Top N",
+  weak_bundle_enabled: "Bundle the weakest Top-N properties into one property",
+  weak_bundle_size: "How many weakest properties are bundled together",
+  weak_bundle_name: "Display name for the weakest-properties bundle",
+  people_weight: "Points added per person in the consumption formula",
+  task_weight: "Points added per task",
+  base_unit_value: "USDAI value of one consumption unit",
+  portfolio_floor_share: "Minimum portfolio allocation share (0 to disable)",
+};
+
 const PLATFORM_EXPENSE_PCT = 0.05;
 const PLATFORM_LIQUIDITY_TARGET = 10000;
 const SELL_PRESSURE_FLOOR = 1.0;
 const SELL_PRESSURE_CEILING = 3.0;
-
-const PORTFOLIO_FLOOR_SHARE = parseFloat(
-  process.env.PORTFOLIO_FLOOR_SHARE || "0.002",
-);
 
 const CONTRIBUTOR_RELEASE_PCT = 0.1;
 const PER_TRACK_MIN_PAYOUT = 5;
@@ -1539,7 +1768,7 @@ const USDAI_PAYMENT_ADDRESS = process.env.USDAI_PAYMENT_ADDRESS;
 const SENDER_FIELD_CANDIDATES = ["senderAddress"];
 const DEST_FIELD_CANDIDATES = ["receiverAddress"];
 
-const VALUATION_FORMULA_VERSION = "v1-per-unit-value";
+const VALUATION_FORMULA_VERSION = "v3-weighted-consumption";
 const MIN_MAIN_TOKEN_BUY_USDAI = 0.001;
 
 // =====================================================================
@@ -1781,6 +2010,14 @@ function computePrice(basePrice, scarcityScore, utilityScore) {
 }
 
 async function computePropertyConsumption(propertyId) {
+  const propertyMeta = await pool.query(
+    `SELECT is_bundle FROM properties WHERE id = $1`,
+    [propertyId],
+  );
+  if (propertyMeta.rows[0]?.is_bundle) {
+    return computeBundleConsumption(propertyId);
+  }
+
   const trackResult = await pool.query(
     `WITH members AS (
     SELECT DISTINCT tc.track_id
@@ -1795,34 +2032,53 @@ async function computePropertyConsumption(propertyId) {
     [propertyId],
   );
 
-  const trackConsumption =
-    Number(trackResult.rows[0]?.total_plays || 0) +
-    Number(trackResult.rows[0]?.total_likes || 0);
+  const totalPlays = Number(trackResult.rows[0]?.total_plays || 0);
+  const totalLikes = Number(trackResult.rows[0]?.total_likes || 0);
 
+  // Count distinct people: a person with two roles still counts once.
   const peopleResult = await pool.query(
-    `SELECT COUNT(*)::int AS people_count FROM property_people WHERE property_id = $1`,
+    `SELECT COUNT(DISTINCT person_flo_id)::int AS people_count
+     FROM property_people
+     WHERE property_id = $1 AND COALESCE(status, 'active') = 'active'`,
     [propertyId],
   );
-  const peopleContribution =
-    Number(peopleResult.rows[0]?.people_count || 0) * 10;
 
   const tasksResult = await pool.query(
     `SELECT COUNT(*)::int AS task_count FROM property_tasks WHERE property_id = $1`,
     [propertyId],
   );
-  const tasksContribution = Number(tasksResult.rows[0]?.task_count || 0) * 5;
 
-  const hasPeopleOrTasks = peopleContribution > 0 || tasksContribution > 0;
-  const minConsumption = hasPeopleOrTasks ? 1 : 0;
+  // Admin score: additive bonus (positive) or penalty (negative)
+  const adminScoreResult = await pool.query(
+    `SELECT COALESCE(admin_score, 0)::numeric AS admin_score FROM properties WHERE id = $1`,
+    [propertyId],
+  );
 
-  return Math.max(
-    trackConsumption + peopleContribution + tasksContribution,
-    minConsumption,
+  return computeConsumption(
+    {
+      plays: totalPlays,
+      likes: totalLikes,
+      people: Number(peopleResult.rows[0]?.people_count || 0),
+      tasks: Number(tasksResult.rows[0]?.task_count || 0),
+      adminScore: Number(adminScoreResult.rows[0]?.admin_score || 0),
+    },
+    marketplaceConfig,
   );
 }
 
+async function computeBundleConsumption(bundlePropertyId) {
+  const result = await pool.query(
+    `SELECT COALESCE(SUM(p.consumption), 0)::numeric AS total
+     FROM property_bundle_members bm
+     JOIN properties p ON p.id = bm.member_property_id
+     WHERE bm.bundle_property_id = $1`,
+    [bundlePropertyId],
+  );
+  return Number(result.rows[0]?.total || 0);
+}
+
 function calculateBasePrice(consumption) {
-  return consumption * PER_UNIT_VALUE;
+  return computeBasePrice(consumption, marketplaceConfig);
 }
 
 async function recordValuation(propertyId, consumption, basePrice) {
@@ -1889,9 +2145,11 @@ function isConsumptionGrowthFlat(previousValuation, currentValuation) {
 // =====================================================================
 
 async function getGlobalTop100() {
-  const result = await pool.query(`
+  const result = await pool.query(
+    `
     SELECT id, name, consumption, base_price, current_price,
-           category_id, category_rank, in_top_100, in_global_top_100
+           category_id, category_rank, in_top_100, in_global_top_100,
+           is_bundle, bundle_member_count
     FROM properties
     WHERE status = 'active' AND in_global_top_100 = true
     ORDER BY 
@@ -1900,8 +2158,10 @@ async function getGlobalTop100() {
         ELSE 999 
       END ASC,
       current_price DESC
-    LIMIT 100
-  `);
+    LIMIT $1
+  `,
+    [getTopN()],
+  );
   return result.rows;
 }
 
@@ -1978,19 +2238,23 @@ async function isPlatformLiquidityBuilt() {
 // =====================================================================
 
 async function computeMainTokenPressureRatio() {
+  const windowDays = getSellQueuePeriodDays();
   const buyResult = await pool.query(
     `
     SELECT COALESCE(SUM(token_amount), 0)::numeric AS total
     FROM main_token_transactions
-    WHERE type = 'buy' AND created_at > now() - INTERVAL '7 days'
+    WHERE type = 'buy' AND created_at > now() - ($1 * INTERVAL '1 day')
     `,
+    [windowDays],
   );
   const sellResult = await pool.query(
     `
     SELECT COALESCE(SUM(token_amount - paid_amount), 0)::numeric AS total
     FROM sell_queue
-    WHERE requested_at > now() - INTERVAL '7 days'
+    WHERE requested_at > now() - ($1 * INTERVAL '1 day')
+      AND status <> 'expired'
     `,
+    [windowDays],
   );
   const buyVolume = Number(buyResult.rows[0]?.total || 0);
   const sellVolume = Number(sellResult.rows[0]?.total || 0);
@@ -2003,9 +2267,57 @@ function computeSellReleaseFraction(pressureRatio) {
   return Math.min(Math.max(raw, 0), 1);
 }
 
+async function backfillSellQueueExpiry() {
+  const days = getSellQueuePeriodDays();
+  await pool.query(
+    `UPDATE sell_queue
+     SET expires_at = requested_at + ($1 * INTERVAL '1 day')
+     WHERE expires_at IS NULL
+       AND status IN ('queued', 'partially_released')`,
+    [days],
+  );
+}
+
+/**
+ * Expire sell requests that have been waiting longer than
+ * sell_queue_period_days (default 7).  Only unpaid, unlocked rows are touched; any amount already released but not paid is clawed back so the seller keeps their unqueued tokens.
+ */
+async function clearExpiredSellQueue() {
+  const result = await pool.query(
+    `UPDATE sell_queue
+     SET status = 'expired',
+         expired_at = now(),
+         released_amount = LEAST(released_amount, paid_amount)
+     WHERE status IN ('queued', 'partially_released')
+       AND expires_at IS NOT NULL
+       AND expires_at <= now()
+       AND payout_locked_at IS NULL
+       AND paid_amount < token_amount
+     RETURNING id, flo_id, token_amount, paid_amount, released_amount`,
+  );
+
+  if (result.rowCount > 0) {
+    await logAuditEvent("sell_queue_expired", {
+      count: result.rowCount,
+      rows: result.rows.slice(0, 100).map((r) => ({
+        id: r.id,
+        floId: r.flo_id,
+        tokenAmount: Number(r.token_amount),
+        paidAmount: Number(r.paid_amount),
+      })),
+    });
+  }
+
+  return result.rowCount;
+}
+
 async function releaseSellQueue() {
+  const expired = await clearExpiredSellQueue();
+
   const liquidityBuilt = await isPlatformLiquidityBuilt();
-  if (!liquidityBuilt) return { releaseFraction: 0, updated: 0 };
+  if (!liquidityBuilt) {
+    return { releaseFraction: 0, updated: 0, expired };
+  }
 
   const poolResult = await pool.query(
     `SELECT balance FROM platform_liquidity WHERE id = 1`,
@@ -2055,7 +2367,14 @@ async function releaseSellQueue() {
     updated += 1;
   }
 
-  return { releaseFraction, updated, totalQueuedValue, safeBudget, tokenPrice };
+  return {
+    releaseFraction,
+    updated,
+    totalQueuedValue,
+    safeBudget,
+    tokenPrice,
+    expired,
+  };
 }
 
 // =====================================================================
@@ -2069,15 +2388,15 @@ function computePortfolioAllocation(top100Properties) {
   );
   if (totalConsumption <= 0 || top100Properties.length === 0) return [];
 
+  const floorShare = Number(marketplaceConfig.portfolio_floor_share) || 0;
   const rawShares = top100Properties.map((p) => {
     const consumptionShare = Number(p.consumption || 0) / totalConsumption;
     const share =
-      PORTFOLIO_FLOOR_SHARE > 0
-        ? Math.max(consumptionShare, PORTFOLIO_FLOOR_SHARE)
-        : consumptionShare;
+      floorShare > 0 ? Math.max(consumptionShare, floorShare) : consumptionShare;
     return {
       property_id: p.id,
       share: share,
+      consumptionShare: consumptionShare,
     };
   });
 
@@ -2085,12 +2404,48 @@ function computePortfolioAllocation(top100Properties) {
   return rawShares.map((s) => ({
     property_id: s.property_id,
     share: s.share / total,
+    consumptionShare: s.consumptionShare,
   }));
 }
 
 // =====================================================================
 // CONTRIBUTOR PAYOUTS
 // =====================================================================
+
+async function resolvePayoutTargets(dbClient, propertyId) {
+  const property = await dbClient.query(
+    `SELECT is_bundle FROM properties WHERE id = $1`,
+    [propertyId],
+  );
+  if (!property.rows.length) return [];
+  if (!property.rows[0].is_bundle) {
+    return [{ propertyId, weight: 1 }];
+  }
+
+  const members = await dbClient.query(
+    `SELECT p.id, p.consumption
+     FROM property_bundle_members bm
+     JOIN properties p ON p.id = bm.member_property_id
+     WHERE bm.bundle_property_id = $1`,
+    [propertyId],
+  );
+  if (!members.rows.length) return [];
+
+  const total = members.rows.reduce(
+    (sum, m) => sum + Number(m.consumption || 0),
+    0,
+  );
+  if (total <= 0) {
+    return members.rows.map((m) => ({
+      propertyId: m.id,
+      weight: 1 / members.rows.length,
+    }));
+  }
+  return members.rows.map((m) => ({
+    propertyId: m.id,
+    weight: Number(m.consumption || 0) / total,
+  }));
+}
 
 async function releaseContributorPayouts() {
   const client = await pool.connect();
@@ -2150,43 +2505,48 @@ async function releaseContributorPayouts() {
     let totalCreated = 0;
     for (const a of allocation) {
       const propertyReleaseAmount = releaseAmount * a.share;
+      const targets = await resolvePayoutTargets(client, a.property_id);
 
-      const componentsResult = await client.query(
-        `
-        SELECT tc.id AS component_id, tc.contributor_flo_id,
-               COALESCE(play_totals.total_plays, 0) + COALESCE(like_totals.total_likes, 0) AS consumption
-        FROM property_components pc
-        JOIN tracks_components tc ON tc.id = pc.component_id
-        LEFT JOIN (
-          SELECT track_id, SUM(play_count)::numeric AS total_plays FROM plays GROUP BY track_id
-        ) play_totals ON play_totals.track_id = tc.track_id
-        LEFT JOIN (
-          SELECT track_id, COUNT(*)::numeric AS total_likes FROM likes GROUP BY track_id
-        ) like_totals ON like_totals.track_id = tc.track_id
-        WHERE pc.property_id = $1
-        `,
-        [a.property_id],
-      );
+      for (const target of targets) {
+        const targetReleaseAmount = propertyReleaseAmount * target.weight;
 
-      const totalComponentConsumption = componentsResult.rows.reduce(
-        (sum, r) => sum + Number(r.consumption),
-        0,
-      );
-      if (totalComponentConsumption <= 0) continue;
-
-      for (const row of componentsResult.rows) {
-        const share = Number(row.consumption) / totalComponentConsumption;
-        const amount = propertyReleaseAmount * share;
-        if (amount < PER_TRACK_MIN_PAYOUT) continue;
-
-        await client.query(
+        const componentsResult = await client.query(
           `
-          INSERT INTO property_payouts (property_id, component_id, recipient_flo_id, amount, status)
-          VALUES ($1, $2, $3, $4, 'pending')
+          SELECT tc.id AS component_id, tc.contributor_flo_id,
+                 COALESCE(play_totals.total_plays, 0) + COALESCE(like_totals.total_likes, 0) AS consumption
+          FROM property_components pc
+          JOIN tracks_components tc ON tc.id = pc.component_id
+          LEFT JOIN (
+            SELECT track_id, SUM(play_count)::numeric AS total_plays FROM plays GROUP BY track_id
+          ) play_totals ON play_totals.track_id = tc.track_id
+          LEFT JOIN (
+            SELECT track_id, COUNT(*)::numeric AS total_likes FROM likes GROUP BY track_id
+          ) like_totals ON like_totals.track_id = tc.track_id
+          WHERE pc.property_id = $1
           `,
-          [a.property_id, row.component_id, row.contributor_flo_id, amount],
+          [target.propertyId],
         );
-        totalCreated += amount;
+
+        const totalComponentConsumption = componentsResult.rows.reduce(
+          (sum, r) => sum + Number(r.consumption),
+          0,
+        );
+        if (totalComponentConsumption <= 0) continue;
+
+        for (const row of componentsResult.rows) {
+          const share = Number(row.consumption) / totalComponentConsumption;
+          const amount = targetReleaseAmount * share;
+          if (amount < PER_TRACK_MIN_PAYOUT) continue;
+
+          await client.query(
+            `
+            INSERT INTO property_payouts (property_id, component_id, recipient_flo_id, amount, status)
+            VALUES ($1, $2, $3, $4, 'pending')
+            `,
+            [target.propertyId, row.component_id, row.contributor_flo_id, amount],
+          );
+          totalCreated += amount;
+        }
       }
     }
 
@@ -2516,9 +2876,224 @@ async function updatePropertyLifecycles() {
     WHERE lifecycle_state = 'eligible'
       AND status = 'active'
       AND NOT in_global_top_100
+      AND bundled_into_property_id IS NULL
       AND consumption >= 1000
       AND created_at < now() - INTERVAL '14 days'
   `);
+}
+
+// =====================================================================
+// WEAKEST-PROPERTIES BUNDLE
+// =====================================================================
+
+const WEAK_BUNDLE_KEY = "weakest";
+
+async function getWeakestBundleProperty(db = pool) {
+  const result = await db.query(
+    `SELECT * FROM properties WHERE bundle_key = $1 LIMIT 1`,
+    [WEAK_BUNDLE_KEY],
+  );
+  return result.rows[0] || null;
+}
+
+async function deactivateWeakestBundle(db = pool) {
+  const bundle = await getWeakestBundleProperty(db);
+  if (!bundle) return null;
+
+  await db.query(
+    `UPDATE properties SET bundled_into_property_id = NULL
+     WHERE bundled_into_property_id = $1`,
+    [bundle.id],
+  );
+  await db.query(
+    `DELETE FROM property_bundle_members WHERE bundle_property_id = $1`,
+    [bundle.id],
+  );
+  await db.query(
+    `UPDATE properties
+     SET status = 'archived',
+         in_top_100 = false,
+         in_global_top_100 = false,
+         category_rank = NULL,
+         bundle_member_count = 0
+     WHERE id = $1`,
+    [bundle.id],
+  );
+  return bundle.id;
+}
+
+/**
+ * Replace the bottom `weak_bundle_size` entries of the global ranking with one synthetic property.  Its consumption/price are the sum of its members, so portfolio shares and system valuation stay unchanged, but it occupies a single Top-N slot and pays members' contributors proportionally.
+ */
+async function syncWeakestBundle(globalRanked) {
+  const size = parseInt(marketplaceConfig.weak_bundle_size, 10);
+  const enabled = marketplaceConfig.weak_bundle_enabled === true;
+  const topN = getTopN();
+  // Only collapse the tail when the Top N is actually full.  With 100 qualifying properties this produces 95 individual properties + one bundle of the weakest 5, exactly as discussed.
+  const canBundle =
+    enabled &&
+    Number.isInteger(size) &&
+    size >= 2 &&
+    globalRanked.length >= topN &&
+    globalRanked.length >= size + 1;
+
+  if (!canBundle) {
+    await deactivateWeakestBundle(pool);
+    return { individuals: globalRanked, bundle: null };
+  }
+
+  const individualCount = globalRanked.length - size;
+  const individuals = globalRanked.slice(0, individualCount);
+  const members = globalRanked.slice(individualCount);
+
+  const totalConsumption = members.reduce(
+    (sum, m) => sum + Number(m.consumption || 0),
+    0,
+  );
+  const weightSum = members.reduce(
+    (sum, m) => sum + Math.max(Number(m.consumption || 0), 0),
+    0,
+  );
+  const weightedAverage = (key) => {
+    if (weightSum > 0) {
+      return (
+        members.reduce(
+          (sum, m) =>
+            sum + Number(m[key] || 0) * Math.max(Number(m.consumption || 0), 0),
+          0,
+        ) / weightSum
+      );
+    }
+    return (
+      members.reduce((sum, m) => sum + Number(m[key] || 0), 0) /
+      Math.max(members.length, 1)
+    );
+  };
+
+  const bundleConsumption = totalConsumption;
+  const bundleBasePrice = members.reduce(
+    (sum, m) => sum + Number(m.base_price || 0),
+    0,
+  );
+  const bundleCurrentPrice = members.reduce(
+    (sum, m) => sum + Number(m.price || 0),
+    0,
+  );
+  const bundleScarcity = weightedAverage("scarcity");
+  const bundleUtility = weightedAverage("utility");
+  const bundleRank = individualCount + 1;
+  const memberIds = members.map((m) => m.id);
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    let bundle = await getWeakestBundleProperty(client);
+
+    if (bundle) {
+      const updated = await client.query(
+        `UPDATE properties
+         SET name = $1,
+             status = 'active',
+             category_id = NULL,
+             is_bundle = true,
+             bundle_key = $2,
+             bundle_member_count = $3,
+             consumption = $4,
+             base_price = $5,
+             current_price = $6,
+             scarcity_score = $7,
+             utility_score = $8,
+             category_rank = $9,
+             in_top_100 = true,
+             in_global_top_100 = true,
+             total_slots = $3,
+             lifecycle_state = 'active',
+             valuation_updated_at = now(),
+             updated_at = now()
+         WHERE id = $10
+         RETURNING *`,
+        [
+          marketplaceConfig.weak_bundle_name,
+          WEAK_BUNDLE_KEY,
+          members.length,
+          bundleConsumption,
+          bundleBasePrice,
+          bundleCurrentPrice,
+          bundleScarcity,
+          bundleUtility,
+          bundleRank,
+          bundle.id,
+        ],
+      );
+      bundle = updated.rows[0];
+    } else {
+      const inserted = await client.query(
+        `INSERT INTO properties
+           (name, status, category_id, is_bundle, bundle_key,
+            bundle_member_count, consumption, base_price, current_price,
+            scarcity_score, utility_score, category_rank, in_top_100,
+            in_global_top_100, total_slots, lifecycle_state,
+            valuation_updated_at)
+         VALUES ($1, 'active', NULL, true, $2,
+                 $3, $4, $5, $6,
+                 $7, $8, $9, true,
+                 true, $3, 'active',
+                 now())
+         RETURNING *`,
+        [
+          marketplaceConfig.weak_bundle_name,
+          WEAK_BUNDLE_KEY,
+          members.length,
+          bundleConsumption,
+          bundleBasePrice,
+          bundleCurrentPrice,
+          bundleScarcity,
+          bundleUtility,
+          bundleRank,
+        ],
+      );
+      bundle = inserted.rows[0];
+    }
+
+    // Release properties that were bundled previously but are not members now.
+    await client.query(
+      `UPDATE properties
+       SET bundled_into_property_id = NULL
+       WHERE bundled_into_property_id = $1
+         AND NOT (id = ANY($2::int[]))`,
+      [bundle.id, memberIds],
+    );
+
+    // Members are represented by the bundle, not individually.
+    await client.query(
+      `UPDATE properties
+       SET bundled_into_property_id = $1,
+           in_top_100 = false,
+           in_global_top_100 = false,
+           category_rank = NULL
+       WHERE id = ANY($2::int[])`,
+      [bundle.id, memberIds],
+    );
+
+    await client.query(
+      `DELETE FROM property_bundle_members WHERE bundle_property_id = $1`,
+      [bundle.id],
+    );
+    await client.query(
+      `INSERT INTO property_bundle_members (bundle_property_id, member_property_id)
+       SELECT $1, unnest($2::int[])`,
+      [bundle.id, memberIds],
+    );
+
+    await client.query("COMMIT");
+    return { individuals, bundle };
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
+  }
 }
 
 // =====================================================================
@@ -2629,16 +3204,23 @@ async function runFinancialAllocation() {
   const top100 = await getGlobalTop100();
   const rawAllocations = [];
 
+  // Compute Total_Consumption over the Top N first, then derive each property's Consumption_Share from the same denominator.
+  const enriched = [];
   for (const property of top100) {
-    const financeAllocation = await computeFinanceAllocation(property.id);
-    const consumption = await computePropertyConsumption(property.id);
+    const consumption = property.is_bundle
+      ? Number(property.consumption || 0)
+      : await computePropertyConsumption(property.id);
+    enriched.push({ property, consumption });
+  }
+  const totalConsumption = enriched.reduce(
+    (sum, entry) => sum + Number(entry.consumption || 0),
+    0,
+  );
 
-    const totalConsumptionResult = await pool.query(
-      `SELECT COALESCE(SUM(consumption), 1)::numeric AS total 
-       FROM properties WHERE in_global_top_100 = true`,
-    );
-    const totalConsumption = Number(totalConsumptionResult.rows[0]?.total || 1);
-    const consumptionShare = consumption / totalConsumption;
+  for (const { property, consumption } of enriched) {
+    const financeAllocation = await computeFinanceAllocation(property.id);
+    const consumptionShare =
+      totalConsumption > 0 ? consumption / totalConsumption : 0;
 
     let rawScore = 0;
 
@@ -2732,13 +3314,16 @@ async function runMarketplacePipeline() {
   console.log(`Starting marketplace pipeline at ${new Date().toISOString()}`);
 
   try {
+    await expireStaleInvitations();
+
     const populated = await pool.query(`
       SELECT DISTINCT p.id, p.category_id, p.high_scarcity_streak, p.total_slots
       FROM properties p
       WHERE p.status = 'active'
+        AND COALESCE(p.is_bundle, false) = false
         AND (
           EXISTS (SELECT 1 FROM property_components pc WHERE pc.property_id = p.id)
-          OR EXISTS (SELECT 1 FROM property_people pp WHERE pp.property_id = p.id)
+          OR EXISTS (SELECT 1 FROM property_people pp WHERE pp.property_id = p.id AND COALESCE(pp.status, 'active') = 'active')
           OR EXISTS (SELECT 1 FROM finance_components fc WHERE fc.property_id = p.id)
           OR EXISTS (SELECT 1 FROM property_tasks pt WHERE pt.property_id = p.id)
         )
@@ -2789,10 +3374,10 @@ async function runMarketplacePipeline() {
         base_price: basePrice,
         consumption,
         price,
+        scarcity,
+        utility,
       });
     }
-
-    await updatePropertyLifecycles();
 
     const categories = await pool.query(
       "SELECT id, independent_ranking FROM categories",
@@ -2801,30 +3386,37 @@ async function runMarketplacePipeline() {
       categories.rows.filter((c) => c.independent_ranking).map((c) => c.id),
     );
 
+    const existingBundle = await getWeakestBundleProperty(pool);
+    const resetIds = scored.map((s) => s.id);
+    if (existingBundle) resetIds.push(existingBundle.id);
+
     await pool.query(
       `UPDATE properties 
        SET category_rank = NULL, 
            in_top_100 = false, 
            in_global_top_100 = false 
        WHERE id = ANY($1)`,
-      [scored.map((s) => s.id)],
+      [resetIds],
     );
 
+    const topN = getTopN();
     const globalEligible = scored.filter(
       (s) => !independentCategoryIds.has(s.category_id),
     );
     const globalRanked = [...globalEligible]
       .sort((a, b) => b.price - a.price)
-      .slice(0, 100);
+      .slice(0, topN);
 
-    for (let i = 0; i < globalRanked.length; i++) {
+    const { individuals, bundle } = await syncWeakestBundle(globalRanked);
+
+    for (let i = 0; i < individuals.length; i++) {
       await pool.query(
         `UPDATE properties 
          SET category_rank = $1, 
              in_top_100 = true, 
              in_global_top_100 = true 
          WHERE id = $2`,
-        [i + 1, globalRanked[i].id],
+        [i + 1, individuals[i].id],
       );
     }
 
@@ -2832,7 +3424,7 @@ async function runMarketplacePipeline() {
       const categoryScored = scored.filter((s) => s.category_id === categoryId);
       const categoryRanked = [...categoryScored]
         .sort((a, b) => b.price - a.price)
-        .slice(0, 100);
+        .slice(0, topN);
 
       for (let i = 0; i < categoryRanked.length; i++) {
         await pool.query(
@@ -2845,6 +3437,9 @@ async function runMarketplacePipeline() {
         );
       }
     }
+
+    // Run after ranking so newly bundled members cannot graduate.
+    await updatePropertyLifecycles();
 
     const systemValuation = await computeSystemValuation();
     const totalSupply = await getTotalMainTokenSupply();
@@ -2867,7 +3462,7 @@ async function runMarketplacePipeline() {
     const duration = Math.round((Date.now() - pipelineStartTime) / 1000);
     console.log(
       `Marketplace pipeline complete (${duration}s): ${scored.length} properties scored, ` +
-        `global_top_100=${top100.length}, ` +
+        `global_top_n=${top100.length}${bundle ? ` (incl. bundle of ${bundle.bundle_member_count})` : ""}, ` +
         `system_valuation=${systemValuation}, token_price=${tokenPrice}, ` +
         `payouts: ${payoutResult.paid} paid / ${payoutResult.failed} failed`,
     );
@@ -2890,7 +3485,10 @@ async function runMarketplacePipeline() {
   }
 }
 
-const PIPELINE_INTERVAL_MS = 5 * 60 * 1000;
+const PIPELINE_INTERVAL_MS = (() => {
+  const parsed = parseInt(process.env.PIPELINE_INTERVAL_MS || "", 10);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : 5 * 60 * 1000;
+})();
 const marketplacePipelineInterval = setInterval(
   runMarketplacePipeline,
   PIPELINE_INTERVAL_MS,
@@ -2928,14 +3526,47 @@ app.get("/api/categories", async (req, res) => {
 
 app.get("/api/marketplace/overview", async (req, res) => {
   try {
-    const [people, finance, marketing] = await Promise.all([
+    const [
+      memberships,
+      uniquePeople,
+      propertyCount,
+      finance,
+      financeAllocations,
+      payouts,
+      royaltySplits,
+      creative,
+      marketing,
+      tasks,
+      taskClaims,
+      invitationCounts,
+    ] = await Promise.all([
       pool.query(`
-        SELECT p.*, pp.property_id, pr.name AS property_name, pp.role
+        SELECT p.flo_id, p.name, p.work_profile, p.profile_image_url,
+               pp.property_id, pr.name AS property_name, pp.role, pp.part,
+               pp.joined_at
         FROM people p
-        LEFT JOIN property_people pp ON p.flo_id = pp.person_flo_id
+        LEFT JOIN property_people pp
+          ON pp.person_flo_id = p.flo_id
+         AND COALESCE(pp.status, 'active') = 'active'
         LEFT JOIN properties pr ON pp.property_id = pr.id
-        ORDER BY p.flo_id
+        ORDER BY p.name NULLS LAST, pr.name NULLS LAST, pp.role
       `),
+      pool.query(`
+        SELECT p.*,
+               COUNT(DISTINCT pp.property_id) FILTER (
+                 WHERE COALESCE(pp.status, 'active') = 'active'
+               )::int AS property_count,
+               COUNT(pp.*) FILTER (
+                 WHERE COALESCE(pp.status, 'active') = 'active'
+               )::int AS membership_count
+        FROM people p
+        LEFT JOIN property_people pp ON pp.person_flo_id = p.flo_id
+        GROUP BY p.flo_id
+        ORDER BY p.name NULLS LAST, p.flo_id
+      `),
+      pool.query(
+        `SELECT COUNT(*)::int AS count FROM properties WHERE status = 'active'`,
+      ),
       pool.query(`
         SELECT fc.*, pr.name AS property_name
         FROM finance_components fc
@@ -2943,23 +3574,265 @@ app.get("/api/marketplace/overview", async (req, res) => {
         ORDER BY fc.created_at DESC
       `),
       pool.query(`
-        SELECT tc.*, pr.name AS property_name, pc.property_id
+        SELECT pfa.*, pr.name AS property_name
+        FROM property_finance_allocations pfa
+        LEFT JOIN properties pr ON pr.id = pfa.property_id
+        ORDER BY pfa.allocation_pct DESC
+      `),
+      pool.query(`
+        SELECT pp.*, pr.name AS property_name
+        FROM property_payouts pp
+        LEFT JOIN properties pr ON pr.id = pp.property_id
+        ORDER BY pp.created_at DESC
+      `),
+      pool.query(`
+        SELECT rs.*, fc.title AS finance_title, fc.property_id,
+               pr.name AS property_name
+        FROM royalty_splits rs
+        JOIN finance_components fc ON fc.id = rs.finance_component_id
+        LEFT JOIN properties pr ON pr.id = fc.property_id
+        ORDER BY rs.created_at DESC
+      `),
+      pool.query(
+        `SELECT tc.*, pc.property_id, pr.name AS property_name
+         FROM tracks_components tc
+         LEFT JOIN property_components pc ON pc.component_id = tc.id
+         LEFT JOIN properties pr ON pr.id = pc.property_id
+         WHERE tc.component_type = ANY($1::text[])
+         ORDER BY tc.created_at DESC`,
+        [["lyrics", "music", "vocals"]],
+      ),
+      pool.query(`
+        SELECT tc.*, pc.property_id, pr.name AS property_name
         FROM tracks_components tc
-        LEFT JOIN property_components pc ON tc.id = pc.component_id
-        LEFT JOIN properties pr ON pc.property_id = pr.id
+        LEFT JOIN property_components pc ON pc.component_id = tc.id
+        LEFT JOIN properties pr ON pr.id = pc.property_id
         WHERE tc.component_type = 'marketing'
         ORDER BY tc.created_at DESC
       `),
+      pool.query(`
+        SELECT t.*, pt.property_id, pr.name AS property_name
+        FROM tasks t
+        LEFT JOIN property_tasks pt ON pt.task_id = t.id
+        LEFT JOIN properties pr ON pr.id = pt.property_id
+        ORDER BY t.created_at DESC
+      `),
+      pool.query(`SELECT DISTINCT task_id FROM task_claims`),
+      pool.query(
+        `SELECT CASE
+                  WHEN status = 'pending' AND expires_at <= now() THEN 'expired'
+                  ELSE status
+                END AS status,
+                COUNT(*)::int AS count
+         FROM property_invitations
+         GROUP BY 1`,
+      ),
     ]);
+
+    const uniqueCreativeComponents = new Map(
+      creative.rows.map((component) => [component.id, component]),
+    );
+    const uniqueMarketingComponents = new Set(
+      marketing.rows.map((component) => component.id),
+    );
+    const uniqueTasks = new Map(tasks.rows.map((task) => [task.id, task]));
+
+    const creativeByType = { lyrics: 0, music: 0, vocals: 0 };
+    for (const component of uniqueCreativeComponents.values()) {
+      if (component.component_type in creativeByType) {
+        creativeByType[component.component_type] += 1;
+      }
+    }
+
+    const invitationCountsByStatus = {};
+    for (const row of invitationCounts.rows) {
+      invitationCountsByStatus[row.status] = Number(row.count);
+    }
+
+    const financeComponentAmount = finance.rows.reduce(
+      (sum, item) => sum + Number(item.amount || 0),
+      0,
+    );
+    const pendingPayoutAmount = payouts.rows
+      .filter((p) => ["pending", "sending"].includes(p.status))
+      .reduce((sum, p) => sum + Number(p.amount || 0), 0);
+    const paidPayoutAmount = payouts.rows
+      .filter((p) => p.status === "paid")
+      .reduce((sum, p) => sum + Number(p.amount || 0), 0);
+    const royaltyShareTotal = royaltySplits.rows.reduce(
+      (sum, split) => sum + Number(split.share_percentage || 0),
+      0,
+    );
 
     res.json({
       success: true,
-      people: people.rows,
+      counts: {
+        uniquePeople: uniquePeople.rows.length,
+        memberships: memberships.rows.filter((row) => row.property_id).length,
+        properties: Number(propertyCount.rows[0]?.count || 0),
+        creativeComponents: uniqueCreativeComponents.size,
+        creativeByType,
+        financeComponents: finance.rows.length,
+        financeAllocations: financeAllocations.rows.length,
+        payouts: payouts.rows.length,
+        royaltySplits: royaltySplits.rows.length,
+        tasks: uniqueTasks.size,
+        taskLinks: tasks.rows.length,
+        claimedTasks: taskClaims.rows.length,
+        marketingComponents: uniqueMarketingComponents.size,
+        pendingInvitations: invitationCountsByStatus.pending || 0,
+      },
+      invitations: invitationCountsByStatus,
+      summaries: {
+        finance: {
+          componentAmount: financeComponentAmount,
+          pendingPayoutAmount,
+          paidPayoutAmount,
+          allocationPctTotal: financeAllocations.rows.reduce(
+            (sum, item) => sum + Number(item.allocation_pct || 0),
+            0,
+          ),
+        },
+        royalty: {
+          splitCount: royaltySplits.rows.length,
+          totalSharePercentage: royaltyShareTotal,
+        },
+        tasks: {
+          open: [...uniqueTasks.values()].filter(
+            (task) => task.status === "open",
+          ).length,
+          completed: [...uniqueTasks.values()].filter(
+            (task) => task.status === "completed",
+          ).length,
+        },
+      },
+      // Legacy shape: one row per membership, kept for existing UI clients.
+      people: memberships.rows,
+      uniquePeople: uniquePeople.rows,
       finance: finance.rows,
+      financeAllocations: financeAllocations.rows,
+      payouts: payouts.rows,
+      royaltySplits: royaltySplits.rows,
+      creative: creative.rows,
       marketing: marketing.rows,
+      tasks: tasks.rows,
     });
   } catch (err) {
     console.error("Failed to fetch overview:", err);
+    res.status(500).json({ success: false, error: "Database error" });
+  }
+});
+
+// =====================================================================
+// API: MARKETPLACE CONFIG + FORMULAS + CONSUMPTION SHARES
+// =====================================================================
+
+app.get("/api/marketplace/config", (req, res) => {
+  res.json({
+    success: true,
+    config: marketplaceConfig,
+    topN: getTopN(),
+  });
+});
+
+app.get("/api/marketplace/formulas", (req, res) => {
+  res.json({
+    success: true,
+    config: marketplaceConfig,
+    topN: getTopN(),
+    formulas: buildFormulaDescription(marketplaceConfig),
+  });
+});
+
+app.post(
+  "/api/marketplace/config",
+  secureEndpoint({
+    fields: ["adminFloId", "key", "value", "time"],
+    floIdField: "adminFloId",
+    requireAdmin: true,
+    rateLimitOpts: { max: 20, windowMs: 60000 },
+  }),
+  async (req, res) => {
+    const { key, value } = req.body;
+
+    if (!key || !CONFIG_KEYS.includes(key)) {
+      return res.status(400).json({
+        success: false,
+        error: `key must be one of: ${CONFIG_KEYS.join(", ")}`,
+      });
+    }
+
+    let normalized;
+    try {
+      normalized = normalizeConfigValue(key, value);
+    } catch (err) {
+      return res.status(400).json({ success: false, error: err.message });
+    }
+
+    try {
+      await pool.query(
+        `INSERT INTO marketplace_config (key, value, description, updated_by_flo_id, updated_at)
+         VALUES ($1, $2::jsonb, $3, $4, now())
+         ON CONFLICT (key) DO UPDATE SET
+           value = EXCLUDED.value,
+           description = EXCLUDED.description,
+           updated_by_flo_id = EXCLUDED.updated_by_flo_id,
+           updated_at = now()`,
+        [
+          key,
+          JSON.stringify(normalized),
+          CONFIG_DESCRIPTIONS[key] || null,
+          req.verifiedFloId || req.body.adminFloId || null,
+        ],
+      );
+
+      marketplaceConfig = normalizeMarketplaceConfig({
+        ...marketplaceConfig,
+        [key]: normalized,
+      });
+
+      await logAuditEvent("marketplace_config_updated", {
+        floId: req.verifiedFloId || req.body.adminFloId,
+        key,
+        value: normalized,
+        ip: req.ip,
+      });
+
+      res.json({
+        success: true,
+        key,
+        value: marketplaceConfig[key],
+        config: marketplaceConfig,
+        note: "Applies on the next pipeline run (within 5 minutes).",
+      });
+    } catch (err) {
+      console.error("marketplace config update error:", err);
+      res.status(500).json({ success: false, error: "Database error" });
+    }
+  },
+);
+
+app.get("/api/marketplace/consumption", async (req, res) => {
+  try {
+    const top = await getGlobalTop100();
+    const { totalConsumption, properties } = computeConsumptionShares(top);
+
+    res.json({
+      success: true,
+      topN: getTopN(),
+      totalConsumption,
+      properties: properties.map((property) => ({
+        id: property.id,
+        name: property.name,
+        consumption: property.consumption,
+        consumptionShare: property.consumptionShare,
+        consumptionSharePct: property.consumptionShare * 100,
+        isBundle: property.is_bundle || false,
+        bundleMemberCount: Number(property.bundle_member_count || 0),
+      })),
+    });
+  } catch (err) {
+    console.error("Failed to calculate consumption shares:", err);
     res.status(500).json({ success: false, error: "Database error" });
   }
 });
@@ -3234,11 +4107,61 @@ app.post(
   },
 );
 
+app.get("/api/people", async (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit, 10) || 100, 500);
+  try {
+    const result = await pool.query(
+      `SELECT p.*,
+              COUNT(DISTINCT pp.property_id) FILTER (
+                WHERE COALESCE(pp.status, 'active') = 'active'
+              )::int AS property_count,
+              COUNT(pp.*) FILTER (
+                WHERE COALESCE(pp.status, 'active') = 'active'
+              )::int AS membership_count
+       FROM people p
+       LEFT JOIN property_people pp ON pp.person_flo_id = p.flo_id
+       GROUP BY p.flo_id
+       ORDER BY p.name NULLS LAST, p.flo_id
+       LIMIT $1`,
+      [limit],
+    );
+
+    res.json({
+      success: true,
+      count: result.rows.length,
+      people: result.rows,
+    });
+  } catch (err) {
+    console.error("Failed to list people:", err);
+    res.status(500).json({ success: false, error: "Database error" });
+  }
+});
+
 app.get("/api/people/:floId", async (req, res) => {
   try {
     const result = await pool.query(`
       SELECT p.*,
-        (SELECT COUNT(DISTINCT pp.property_id) FROM property_people pp WHERE pp.person_flo_id = p.flo_id) AS property_count,
+        (SELECT COUNT(DISTINCT pp.property_id) FROM property_people pp
+          WHERE pp.person_flo_id = p.flo_id
+            AND COALESCE(pp.status, 'active') = 'active') AS property_count,
+        (SELECT COUNT(*) FROM property_people pp
+          WHERE pp.person_flo_id = p.flo_id
+            AND COALESCE(pp.status, 'active') = 'active') AS membership_count,
+        (SELECT COALESCE(json_agg(DISTINCT pp.role), '[]')
+          FROM property_people pp
+          WHERE pp.person_flo_id = p.flo_id
+            AND COALESCE(pp.status, 'active') = 'active') AS roles,
+        (SELECT COALESCE(json_agg(json_build_object(
+            'property_id', pp.property_id,
+            'property_name', pr.name,
+            'role', pp.role,
+            'part', pp.part,
+            'joined_at', pp.joined_at
+          )), '[]')
+          FROM property_people pp
+          LEFT JOIN properties pr ON pr.id = pp.property_id
+          WHERE pp.person_flo_id = p.flo_id
+            AND COALESCE(pp.status, 'active') = 'active') AS memberships,
         (SELECT COUNT(*) FROM tracks_components tc WHERE tc.contributor_flo_id = p.flo_id) AS component_count,
         (SELECT COUNT(DISTINCT ts.task_id) FROM task_submissions ts WHERE ts.submitter_flo_id = p.flo_id AND ts.is_selected = true) AS task_count
       FROM people p 
@@ -3320,19 +4243,35 @@ app.post(
 
 app.get("/api/properties", async (req, res) => {
   const top100Only = req.query.top100 === "true";
+  const topN = getTopN();
 
   try {
     const result = await pool.query(
       `SELECT p.* FROM properties p
-       JOIN categories c ON c.id = p.category_id
+       LEFT JOIN categories c ON c.id = p.category_id
        WHERE p.status = 'active'
-         AND c.independent_ranking = false
+         AND (p.is_bundle = true OR p.bundled_into_property_id IS NULL)
+         AND (p.is_bundle = true OR (c.id IS NOT NULL AND c.independent_ranking = false))
          ${top100Only ? "AND p.in_global_top_100 = true" : ""}
        ORDER BY p.category_rank ASC NULLS LAST, p.created_at DESC
-       LIMIT 100`,
+       LIMIT $1`,
+      [topN],
     );
 
-    res.json({ success: true, properties: result.rows });
+    let properties = result.rows;
+    let totalConsumption = null;
+    if (top100Only) {
+      const shares = computeConsumptionShares(properties);
+      properties = shares.properties;
+      totalConsumption = shares.totalConsumption;
+    }
+
+    res.json({
+      success: true,
+      properties,
+      totalConsumption,
+      topN,
+    });
   } catch (err) {
     console.error(err);
     res.status(500).json({ success: false, error: "Database error" });
@@ -3353,8 +4292,8 @@ app.get("/api/properties/:propertyId", async (req, res) => {
         .json({ success: false, error: "Property not found" });
     }
 
-    const [components, people, finance, tasks, usageEvents] = await Promise.all(
-      [
+    const [components, people, finance, tasks, usageEvents, invitations] =
+      await Promise.all([
         pool.query(
           `SELECT tc.* FROM property_components pc
          JOIN tracks_components tc ON tc.id = pc.component_id
@@ -3362,10 +4301,12 @@ app.get("/api/properties/:propertyId", async (req, res) => {
           [propertyId],
         ),
         pool.query(
-          `SELECT pe.*, pp.role
+          `SELECT pe.*, pp.role, pp.part, pp.status, pp.joined_at, pp.invitation_id
          FROM property_people pp
          JOIN people pe ON pe.flo_id = pp.person_flo_id
-         WHERE pp.property_id = $1`,
+         WHERE pp.property_id = $1
+           AND COALESCE(pp.status, 'active') = 'active'
+         ORDER BY pe.name NULLS LAST, pp.role`,
           [propertyId],
         ),
         pool.query(
@@ -3399,17 +4340,60 @@ app.get("/api/properties/:propertyId", async (req, res) => {
           `SELECT * FROM property_usage_events WHERE property_id = $1 ORDER BY created_at DESC`,
           [propertyId],
         ),
-      ],
-    );
+        pool.query(
+          `SELECT pi.id, pi.invitee_flo_id, pe.name AS invitee_name,
+                  pi.part, pi.role, pi.status, pi.expires_at, pi.created_at
+           FROM property_invitations pi
+           LEFT JOIN people pe ON pe.flo_id = pi.invitee_flo_id
+           WHERE pi.property_id = $1 AND pi.status = 'pending'
+             AND pi.expires_at > now()
+           ORDER BY pi.created_at DESC`,
+          [propertyId],
+        ),
+      ]);
+
+    let bundleMembers = [];
+    if (property.rows[0].is_bundle) {
+      const members = await pool.query(
+        `SELECT p.id, p.name, p.consumption, p.base_price, p.current_price,
+                p.category_id, p.category_rank
+         FROM property_bundle_members bm
+         JOIN properties p ON p.id = bm.member_property_id
+         WHERE bm.bundle_property_id = $1
+         ORDER BY p.consumption DESC`,
+        [propertyId],
+      );
+      bundleMembers = members.rows;
+    }
+
+    const uniquePeople = new Set(people.rows.map((p) => p.flo_id)).size;
+    const creativeComponents = components.rows.filter((c) =>
+      ["lyrics", "music", "vocals"].includes(c.component_type),
+    ).length;
+    const counts = {
+      people: uniquePeople,
+      memberships: people.rows.length,
+      components: components.rows.length,
+      creativeComponents,
+      financeComponents: finance.rows.length,
+      tasks: tasks.rows.length,
+      usageEvents: usageEvents.rows.length,
+      pendingInvitations: invitations.rows.length,
+    };
 
     res.json({
       success: true,
       property: property.rows[0],
       components: components.rows,
       people: people.rows,
+      peopleCount: uniquePeople,
+      membershipCount: people.rows.length,
+      counts,
       finance: finance.rows,
       tasks: tasks.rows,
       usageEvents: usageEvents.rows,
+      invitations: invitations.rows,
+      bundleMembers,
     });
   } catch (err) {
     console.error(err);
@@ -3434,7 +4418,10 @@ app.get("/api/categories/:slug/properties", async (req, res) => {
 
     const result = await pool.query(
       `SELECT * FROM properties
-       WHERE category_id = $1 ${top100Only ? "AND in_top_100 = true" : ""}
+       WHERE category_id = $1
+         AND COALESCE(is_bundle, false) = false
+         AND bundled_into_property_id IS NULL
+         ${top100Only ? "AND in_top_100 = true" : ""}
        ORDER BY category_rank ASC NULLS LAST, created_at DESC`,
       [category.rows[0].id],
     );
@@ -4195,9 +5182,18 @@ app.post(
       }
 
       await pool.query(
-        `INSERT INTO property_people (property_id, person_flo_id, role, added_by_flo_id)
-         VALUES ($1, $2, $3, $4)
-         ON CONFLICT (property_id, person_flo_id, role) DO NOTHING`,
+        `INSERT INTO property_people
+           (property_id, person_flo_id, role, part, status, added_by_flo_id, joined_at)
+         VALUES ($1, $2, $3, 'people', 'active', $4, now())
+         ON CONFLICT (property_id, person_flo_id, role) DO UPDATE SET
+           status = 'active',
+           part = 'people',
+           removed_at = NULL,
+           joined_at = CASE
+             WHEN property_people.status = 'removed' THEN now()
+             ELSE COALESCE(property_people.joined_at, now())
+           END,
+           added_by_flo_id = EXCLUDED.added_by_flo_id`,
         [propertyId, personFloId, role || "", adminFloId],
       );
       await logAuditEvent("person_added_to_property", {
@@ -4228,7 +5224,10 @@ app.post(
     const { role } = req.body;
     try {
       await pool.query(
-        `DELETE FROM property_people WHERE property_id = $1 AND person_flo_id = $2 AND role = $3`,
+        `UPDATE property_people
+         SET status = 'removed', removed_at = now()
+         WHERE property_id = $1 AND person_flo_id = $2 AND role = $3
+           AND COALESCE(status, 'active') = 'active'`,
         [propertyId, personFloId, role || ""],
       );
       await logAuditEvent("person_removed_from_property", {
@@ -4241,6 +5240,615 @@ app.post(
       res.json({ success: true });
     } catch (err) {
       console.error(err);
+      res.status(500).json({ success: false, error: "Database error" });
+    }
+  },
+);
+
+// =====================================================================
+// API: PROPERTY INVITATIONS
+// =====================================================================
+
+app.post(
+  "/api/properties/:propertyId/invitations",
+  secureEndpoint({
+    fields: [
+      "propertyId",
+      "adminFloId",
+      "inviteeFloId",
+      "part",
+      "role",
+      "expiresInDays",
+      "time",
+    ],
+    floIdField: "adminFloId",
+    requireAdmin: true,
+    rateLimitOpts: { max: 20, windowMs: 60000 },
+  }),
+  async (req, res) => {
+    const { propertyId } = req.params;
+    const inviteeFloId = String(req.body.inviteeFloId || "").trim();
+    const part = normalizeInvitationPart(req.body.part);
+
+    if (!inviteeFloId) {
+      return res
+        .status(400)
+        .json({ success: false, error: "Missing inviteeFloId" });
+    }
+    if (!part) {
+      return res.status(400).json({
+        success: false,
+        error: `part must be one of: ${INVITATION_PARTS.join(", ")}`,
+      });
+    }
+
+    const role = (
+      String(req.body.role || "").trim() || defaultInvitationRole(part)
+    ).slice(0, 80);
+    const requestedDays = Number(req.body.expiresInDays);
+    const expiresInDays =
+      Number.isFinite(requestedDays) && requestedDays > 0
+        ? Math.min(
+            Math.max(1, Math.floor(requestedDays)),
+            MAX_INVITATION_EXPIRY_DAYS,
+          )
+        : DEFAULT_INVITATION_EXPIRY_DAYS;
+
+    try {
+      await expireStaleInvitations();
+      const property = await pool.query(
+        `SELECT id, name FROM properties WHERE id = $1 AND status = 'active'`,
+        [propertyId],
+      );
+      if (!property.rows.length) {
+        return res
+          .status(404)
+          .json({ success: false, error: "Property not found" });
+      }
+
+      const activeMembership = await pool.query(
+        `SELECT 1 FROM property_people
+         WHERE property_id = $1 AND person_flo_id = $2 AND role = $3
+           AND COALESCE(status, 'active') = 'active'`,
+        [propertyId, inviteeFloId, role],
+      );
+      if (activeMembership.rows.length) {
+        return res.status(409).json({
+          success: false,
+          error: "That person already has this role on the property",
+        });
+      }
+
+      const existing = await pool.query(
+        `SELECT id, token, expires_at FROM property_invitations
+         WHERE property_id = $1 AND invitee_flo_id = $2
+           AND part = $3 AND role = $4
+           AND status = 'pending' AND expires_at > now()
+         ORDER BY created_at DESC LIMIT 1`,
+        [propertyId, inviteeFloId, part, role],
+      );
+      if (existing.rows.length) {
+        return res.status(409).json({
+          success: false,
+          error: "A pending invitation already exists",
+          invitation: {
+            id: existing.rows[0].id,
+            token: existing.rows[0].token,
+            expiresAt: existing.rows[0].expires_at,
+          },
+        });
+      }
+
+      const token = invitationToken();
+      const result = await pool.query(
+        `INSERT INTO property_invitations
+           (property_id, inviter_flo_id, invitee_flo_id, part, role, token,
+            status, expires_at)
+         VALUES ($1, $2, $3, $4, $5, $6, 'pending',
+                 now() + ($7 * INTERVAL '1 day'))
+         RETURNING *`,
+        [
+          propertyId,
+          req.verifiedFloId || req.body.adminFloId,
+          inviteeFloId,
+          part,
+          role,
+          token,
+          expiresInDays,
+        ],
+      );
+
+      await logAuditEvent("property_invitation_created", {
+        floId: req.verifiedFloId || req.body.adminFloId,
+        propertyId,
+        inviteeFloId,
+        part,
+        role,
+        expiresInDays,
+        ip: req.ip,
+      });
+
+      res.json({
+        success: true,
+        invitation: result.rows[0],
+        acceptEndpoint: `/api/invitations/${token}/accept`,
+      });
+    } catch (err) {
+      console.error("Create invitation error:", err);
+      res.status(500).json({ success: false, error: "Database error" });
+    }
+  },
+);
+
+app.get("/api/properties/:propertyId/invitations", async (req, res) => {
+  try {
+    await expireStaleInvitations();
+    const result = await pool.query(
+      `SELECT pi.id, pi.invitee_flo_id, pe.name AS invitee_name,
+              pi.part, pi.role, pi.status, pi.expires_at,
+              pi.created_at, pi.responded_at
+       FROM property_invitations pi
+       LEFT JOIN people pe ON pe.flo_id = pi.invitee_flo_id
+       WHERE pi.property_id = $1
+       ORDER BY pi.created_at DESC`,
+      [req.params.propertyId],
+    );
+
+    const counts = {};
+    for (const invitation of result.rows) {
+      counts[invitation.status] = (counts[invitation.status] || 0) + 1;
+    }
+
+    res.json({
+      success: true,
+      invitations: result.rows,
+      counts,
+    });
+  } catch (err) {
+    console.error("List invitations error:", err);
+    res.status(500).json({ success: false, error: "Database error" });
+  }
+});
+
+app.post(
+  "/api/invitations/inbox",
+  secureEndpoint({
+    fields: ["floId", "time"],
+    rateLimitOpts: { max: 30, windowMs: 60000 },
+  }),
+  async (req, res) => {
+    try {
+      await expireStaleInvitations();
+      const result = await pool.query(
+        `SELECT pi.id, pi.property_id, pr.name AS property_name,
+                pi.inviter_flo_id, inviter.name AS inviter_name,
+                pi.part, pi.role,
+                CASE WHEN pi.status = 'pending' THEN pi.token ELSE NULL END AS token,
+                CASE WHEN pi.status = 'pending' AND pi.read_at IS NULL
+                     THEN true ELSE false END AS is_unread,
+                pi.read_at, pi.status, pi.expires_at, pi.created_at, pi.responded_at
+         FROM property_invitations pi
+         LEFT JOIN properties pr ON pr.id = pi.property_id
+         LEFT JOIN people inviter ON inviter.flo_id = pi.inviter_flo_id
+         WHERE pi.invitee_flo_id = $1
+         ORDER BY pi.created_at DESC
+         LIMIT 100`,
+        [req.verifiedFloId],
+      );
+
+      const counts = {};
+      for (const invitation of result.rows) {
+        counts[invitation.status] = (counts[invitation.status] || 0) + 1;
+      }
+
+      res.json({
+        success: true,
+        invitations: result.rows,
+        counts,
+        unreadCount: result.rows.filter((row) => row.is_unread).length,
+      });
+    } catch (err) {
+      console.error("Invitation inbox error:", err);
+      res.status(500).json({ success: false, error: "Database error" });
+    }
+  },
+);
+
+app.post(
+  "/api/invitations/unread-count",
+  secureEndpoint({
+    fields: ["floId", "time"],
+    rateLimitOpts: { max: 120, windowMs: 60000 },
+  }),
+  async (req, res) => {
+    try {
+      const result = await pool.query(
+        `SELECT COUNT(*)::int AS count
+         FROM property_invitations
+         WHERE invitee_flo_id = $1
+           AND status = 'pending'
+           AND read_at IS NULL
+           AND expires_at > now()`,
+        [req.verifiedFloId],
+      );
+      res.json({
+        success: true,
+        unreadCount: Number(result.rows[0]?.count || 0),
+      });
+    } catch (err) {
+      console.error("Unread invitation count error:", err);
+      res.status(500).json({ success: false, error: "Database error" });
+    }
+  },
+);
+
+app.post(
+  "/api/invitations/mark-read",
+  secureEndpoint({
+    fields: ["floId", "time"],
+    rateLimitOpts: { max: 60, windowMs: 60000 },
+  }),
+  async (req, res) => {
+    try {
+      const result = await pool.query(
+        `UPDATE property_invitations
+         SET read_at = now()
+         WHERE invitee_flo_id = $1
+           AND status = 'pending'
+           AND read_at IS NULL
+         RETURNING id`,
+        [req.verifiedFloId],
+      );
+      res.json({
+        success: true,
+        markedRead: result.rowCount,
+        unreadCount: 0,
+      });
+    } catch (err) {
+      console.error("Mark invitations read error:", err);
+      res.status(500).json({ success: false, error: "Database error" });
+    }
+  },
+);
+
+app.get("/api/invitations/:token", async (req, res) => {
+  try {
+    await expireStaleInvitations();
+    const result = await pool.query(
+      `SELECT pi.id, pi.property_id, pr.name AS property_name,
+              pi.inviter_flo_id, pi.invitee_flo_id, pi.part, pi.role,
+              pi.status, pi.expires_at, pi.created_at, pi.responded_at
+       FROM property_invitations pi
+       LEFT JOIN properties pr ON pr.id = pi.property_id
+       WHERE pi.token = $1`,
+      [req.params.token],
+    );
+    if (!result.rows.length) {
+      return res
+        .status(404)
+        .json({ success: false, error: "Invitation not found" });
+    }
+
+    const invitation = result.rows[0];
+    res.json({
+      success: true,
+      invitation,
+      canAccept: invitation.status === "pending",
+    });
+  } catch (err) {
+    console.error("Get invitation error:", err);
+    res.status(500).json({ success: false, error: "Database error" });
+  }
+});
+
+app.post(
+  "/api/invitations/:token/accept",
+  secureEndpoint({
+    fields: ["token", "floId", "time"],
+    rateLimitOpts: { max: 20, windowMs: 60000 },
+  }),
+  async (req, res) => {
+    const { token } = req.params;
+    const { floId } = req.body;
+    const client = await pool.connect();
+
+    try {
+      await client.query("BEGIN");
+      await expireStaleInvitations(client);
+
+      const invitationResult = await client.query(
+        `SELECT * FROM property_invitations WHERE token = $1 FOR UPDATE`,
+        [token],
+      );
+      if (!invitationResult.rows.length) {
+        await client.query("ROLLBACK");
+        return res
+          .status(404)
+          .json({ success: false, error: "Invitation not found" });
+      }
+
+      const invitation = invitationResult.rows[0];
+      if (invitation.status === "accepted") {
+        await client.query("ROLLBACK");
+        if (invitation.invitee_flo_id !== floId) {
+          return res.status(403).json({
+            success: false,
+            error: "This invitation belongs to a different FLO ID",
+          });
+        }
+        return res.json({ success: true, alreadyAccepted: true });
+      }
+      if (invitation.status !== "pending") {
+        await client.query("ROLLBACK");
+        return res.status(409).json({
+          success: false,
+          error: `Invitation is ${invitation.status}`,
+        });
+      }
+      if (invitation.invitee_flo_id !== floId) {
+        await client.query("ROLLBACK");
+        return res.status(403).json({
+          success: false,
+          error: "This invitation belongs to a different FLO ID",
+        });
+      }
+
+      // Auto-create a minimal profile so the person can accept even before
+      // filling out their public profile.
+      await client.query(
+        `INSERT INTO people (flo_id, work_profile)
+         VALUES ($1, 'contributor')
+         ON CONFLICT (flo_id) DO NOTHING`,
+        [floId],
+      );
+
+      const membership = await client.query(
+        `INSERT INTO property_people
+           (property_id, person_flo_id, role, part, status,
+            added_by_flo_id, joined_at, invitation_id)
+         VALUES ($1, $2, $3, $4, 'active', $5, now(), $6)
+         ON CONFLICT (property_id, person_flo_id, role) DO UPDATE SET
+           status = 'active',
+           part = EXCLUDED.part,
+           removed_at = NULL,
+           added_by_flo_id = EXCLUDED.added_by_flo_id,
+           joined_at = CASE
+             WHEN property_people.status = 'removed' THEN now()
+             ELSE COALESCE(property_people.joined_at, now())
+           END,
+           invitation_id = EXCLUDED.invitation_id
+         RETURNING *`,
+        [
+          invitation.property_id,
+          floId,
+          invitation.role,
+          invitation.part,
+          invitation.inviter_flo_id,
+          invitation.id,
+        ],
+      );
+
+      await client.query(
+        `UPDATE property_invitations
+         SET status = 'accepted', responded_at = now(),
+             read_at = COALESCE(read_at, now()), updated_at = now()
+         WHERE id = $1`,
+        [invitation.id],
+      );
+
+      await client.query("COMMIT");
+
+      await logAuditEvent("property_invitation_accepted", {
+        floId,
+        propertyId: invitation.property_id,
+        invitationId: invitation.id,
+        part: invitation.part,
+        role: invitation.role,
+        ip: req.ip,
+      });
+
+      res.json({
+        success: true,
+        propertyId: invitation.property_id,
+        part: invitation.part,
+        role: invitation.role,
+        membership: membership.rows[0],
+      });
+    } catch (err) {
+      await client.query("ROLLBACK");
+      console.error("Accept invitation error:", err);
+      res.status(500).json({ success: false, error: "Database error" });
+    } finally {
+      client.release();
+    }
+  },
+);
+
+app.post(
+  "/api/invitations/:token/decline",
+  secureEndpoint({
+    fields: ["token", "floId", "time"],
+    rateLimitOpts: { max: 20, windowMs: 60000 },
+  }),
+  async (req, res) => {
+    const { token } = req.params;
+    const { floId } = req.body;
+    const client = await pool.connect();
+
+    try {
+      await client.query("BEGIN");
+      await expireStaleInvitations(client);
+
+      const invitationResult = await client.query(
+        `SELECT * FROM property_invitations WHERE token = $1 FOR UPDATE`,
+        [token],
+      );
+      if (!invitationResult.rows.length) {
+        await client.query("ROLLBACK");
+        return res
+          .status(404)
+          .json({ success: false, error: "Invitation not found" });
+      }
+
+      const invitation = invitationResult.rows[0];
+      if (invitation.invitee_flo_id !== floId) {
+        await client.query("ROLLBACK");
+        return res.status(403).json({
+          success: false,
+          error: "This invitation belongs to a different FLO ID",
+        });
+      }
+      if (invitation.status === "declined") {
+        await client.query("ROLLBACK");
+        return res.json({ success: true, alreadyDeclined: true });
+      }
+      if (invitation.status !== "pending") {
+        await client.query("ROLLBACK");
+        return res.status(409).json({
+          success: false,
+          error: `Invitation is ${invitation.status}`,
+        });
+      }
+
+      await client.query(
+        `UPDATE property_invitations
+         SET status = 'declined', responded_at = now(),
+             read_at = COALESCE(read_at, now()), updated_at = now()
+         WHERE id = $1`,
+        [invitation.id],
+      );
+      await client.query("COMMIT");
+
+      await logAuditEvent("property_invitation_declined", {
+        floId,
+        propertyId: invitation.property_id,
+        invitationId: invitation.id,
+        ip: req.ip,
+      });
+
+      res.json({ success: true, status: "declined" });
+    } catch (err) {
+      await client.query("ROLLBACK");
+      console.error("Decline invitation error:", err);
+      res.status(500).json({ success: false, error: "Database error" });
+    } finally {
+      client.release();
+    }
+  },
+);
+
+app.post(
+  "/api/properties/:propertyId/invitations/:invitationId/revoke",
+  secureEndpoint({
+    fields: ["propertyId", "invitationId", "adminFloId", "time"],
+    floIdField: "adminFloId",
+    requireAdmin: true,
+    rateLimitOpts: { max: 20, windowMs: 60000 },
+  }),
+  async (req, res) => {
+    const { propertyId, invitationId } = req.params;
+    try {
+      const result = await pool.query(
+        `UPDATE property_invitations
+         SET status = 'revoked', responded_at = now(), updated_at = now()
+         WHERE id = $1 AND property_id = $2 AND status = 'pending'
+         RETURNING *`,
+        [invitationId, propertyId],
+      );
+      if (!result.rows.length) {
+        return res.status(404).json({
+          success: false,
+          error: "Pending invitation not found",
+        });
+      }
+
+      await logAuditEvent("property_invitation_revoked", {
+        floId: req.verifiedFloId || req.body.adminFloId,
+        propertyId,
+        invitationId,
+        ip: req.ip,
+      });
+
+      res.json({ success: true, invitation: result.rows[0] });
+    } catch (err) {
+      console.error("Revoke invitation error:", err);
+      res.status(500).json({ success: false, error: "Database error" });
+    }
+  },
+);
+
+app.post(
+  "/api/properties/:propertyId/invitations/:invitationId/resend",
+  secureEndpoint({
+    fields: [
+      "propertyId",
+      "invitationId",
+      "adminFloId",
+      "expiresInDays",
+      "time",
+    ],
+    floIdField: "adminFloId",
+    requireAdmin: true,
+    rateLimitOpts: { max: 20, windowMs: 60000 },
+  }),
+  async (req, res) => {
+    const { propertyId, invitationId } = req.params;
+    const requestedDays = Number(req.body.expiresInDays);
+    const expiresInDays =
+      Number.isFinite(requestedDays) && requestedDays > 0
+        ? Math.min(
+            Math.max(1, Math.floor(requestedDays)),
+            MAX_INVITATION_EXPIRY_DAYS,
+          )
+        : DEFAULT_INVITATION_EXPIRY_DAYS;
+
+    try {
+      const existing = await pool.query(
+        `SELECT * FROM property_invitations
+         WHERE id = $1 AND property_id = $2`,
+        [invitationId, propertyId],
+      );
+      if (!existing.rows.length) {
+        return res
+          .status(404)
+          .json({ success: false, error: "Invitation not found" });
+      }
+      if (!["pending", "expired"].includes(existing.rows[0].status)) {
+        return res.status(409).json({
+          success: false,
+          error: `Cannot resend a ${existing.rows[0].status} invitation; create a new one`,
+        });
+      }
+
+      const token = invitationToken();
+      const result = await pool.query(
+        `UPDATE property_invitations
+         SET token = $1,
+             status = 'pending',
+             expires_at = now() + ($2 * INTERVAL '1 day'),
+             read_at = NULL,
+             responded_at = NULL,
+             updated_at = now()
+         WHERE id = $3 AND property_id = $4
+         RETURNING *`,
+        [token, expiresInDays, invitationId, propertyId],
+      );
+
+      await logAuditEvent("property_invitation_resent", {
+        floId: req.verifiedFloId || req.body.adminFloId,
+        propertyId,
+        invitationId,
+        expiresInDays,
+        ip: req.ip,
+      });
+
+      res.json({
+        success: true,
+        invitation: result.rows[0],
+        acceptEndpoint: `/api/invitations/${token}/accept`,
+      });
+    } catch (err) {
+      console.error("Resend invitation error:", err);
       res.status(500).json({ success: false, error: "Database error" });
     }
   },
@@ -4491,7 +6099,9 @@ app.post(
       const outstandingResult = await pool.query(
         `SELECT COALESCE(SUM(token_amount - paid_amount), 0)::numeric AS outstanding
          FROM sell_queue
-         WHERE flo_id = $1 AND paid_amount < token_amount`,
+         WHERE flo_id = $1
+           AND paid_amount < token_amount
+           AND status <> 'expired'`,
         [floId],
       );
       const alreadyQueued = Number(outstandingResult.rows[0]?.outstanding || 0);
@@ -4505,11 +6115,11 @@ app.post(
 
       const inserted = await pool.query(
         `
-        INSERT INTO sell_queue (flo_id, token_amount)
-        VALUES ($1, $2)
+        INSERT INTO sell_queue (flo_id, token_amount, expires_at)
+        VALUES ($1, $2, now() + ($3 * INTERVAL '1 day'))
         RETURNING *
         `,
-        [floId, tokenAmount],
+        [floId, tokenAmount, getSellQueuePeriodDays()],
       );
 
       const pressureRatio = await computeMainTokenPressureRatio();
@@ -4523,6 +6133,8 @@ app.post(
       res.json({
         success: true,
         queued: inserted.rows[0],
+        expiresAt: inserted.rows[0].expires_at,
+        sellQueuePeriodDays: getSellQueuePeriodDays(),
         currentPressureRatio: pressureRatio,
         currentReleaseFraction: computeSellReleaseFraction(pressureRatio),
       });
@@ -4539,10 +6151,17 @@ app.get("/api/main-token/sell-queue", async (req, res) => {
       `
       SELECT COUNT(*)::int AS count,
              COALESCE(SUM(token_amount - paid_amount), 0)::numeric AS outstanding_tokens,
-             MIN(requested_at) AS oldest_requested_at
+             MIN(requested_at) AS oldest_requested_at,
+             MIN(expires_at) AS next_expires_at
       FROM sell_queue
       WHERE paid_amount < token_amount
+        AND status <> 'expired'
       `,
+    );
+
+    const expiredResult = await pool.query(
+      `SELECT COUNT(*)::int AS count, MAX(expired_at) AS last_expired_at
+       FROM sell_queue WHERE status = 'expired'`,
     );
 
     const [systemValuation, totalSupply, liquidityBuilt] = await Promise.all([
@@ -4562,8 +6181,13 @@ app.get("/api/main-token/sell-queue", async (req, res) => {
       outstandingTokens,
       outstandingUsdai: outstandingTokens * tokenPrice,
       oldestRequestedAt: row?.oldest_requested_at || null,
+      nextExpiresAt: row?.next_expires_at || null,
+      expiredCount: Number(expiredResult.rows[0]?.count || 0),
+      lastExpiredAt: expiredResult.rows[0]?.last_expired_at || null,
+      sellQueuePeriodDays: getSellQueuePeriodDays(),
       tokenPrice,
       pressureRatio7d: pressureRatio,
+      pressureWindowDays: getSellQueuePeriodDays(),
       releaseFraction: computeSellReleaseFraction(pressureRatio),
     });
   } catch (err) {
@@ -4760,7 +6384,182 @@ app.post(
   },
 );
 
+// =====================================================================
+// API: ADMIN SCORE
+// =====================================================================
+
+// Set (or clear) admin score for a property
+app.post(
+  "/api/properties/:propertyId/admin-score",
+  secureEndpoint({
+    fields: ["propertyId", "adminFloId", "score", "reason", "time"],
+    floIdField: "adminFloId",
+    requireAdmin: true,
+    rateLimitOpts: { max: 30, windowMs: 60000 },
+  }),
+  async (req, res) => {
+    const { propertyId } = req.params;
+    const { score, reason } = req.body;
+
+    const parsed = parseFloat(score);
+    if (isNaN(parsed)) {
+      return res
+        .status(400)
+        .json({ success: false, error: "score must be a number (positive to reward, negative to penalize, 0 to clear)" });
+    }
+
+    try {
+      const result = await pool.query(
+        `UPDATE properties
+         SET admin_score = $1,
+             admin_score_reason = $2,
+             admin_score_updated_at = now()
+         WHERE id = $3
+         RETURNING id, name, admin_score, admin_score_reason, admin_score_updated_at`,
+        [parsed, reason || null, propertyId],
+      );
+
+      if (result.rowCount === 0) {
+        return res.status(404).json({ success: false, error: "Property not found" });
+      }
+
+      await logAuditEvent("admin_score_set", {
+        floId: req.body.adminFloId,
+        propertyId,
+        score: parsed,
+        reason: reason || null,
+        ip: req.ip,
+      });
+
+      res.json({ success: true, property: result.rows[0] });
+    } catch (err) {
+      console.error("admin-score POST error:", err);
+      res.status(500).json({ success: false, error: "Database error" });
+    }
+  },
+);
+
+// Get current admin score for a property
+app.get("/api/properties/:propertyId/admin-score", async (req, res) => {
+  const { propertyId } = req.params;
+  try {
+    const result = await pool.query(
+      `SELECT id, name, admin_score, admin_score_reason, admin_score_updated_at
+       FROM properties WHERE id = $1`,
+      [propertyId],
+    );
+    if (result.rowCount === 0) {
+      return res.status(404).json({ success: false, error: "Property not found" });
+    }
+    res.json({ success: true, property: result.rows[0] });
+  } catch (err) {
+    console.error("admin-score GET error:", err);
+    res.status(500).json({ success: false, error: "Database error" });
+  }
+});
+
 // Proxy Suno page to extract metadata (title, artist, image, lyrics, etc.)
+// `video_url` and `media_urls` fields are the playable assets.
+app.get(
+  "/api/suno-resolve",
+  rateLimit({ max: 60, windowMs: 60000 }),
+  async (req, res) => {
+    const input = String(req.query.url || "").trim();
+    if (!input) {
+      return res.status(400).json({ success: false, error: "Missing url" });
+    }
+
+    let parsed;
+    try {
+      parsed = new URL(input);
+    } catch {
+      return res.status(400).json({ success: false, error: "Invalid URL" });
+    }
+
+    if (
+      !["suno.com", "www.suno.com"].includes(parsed.hostname.toLowerCase()) ||
+      !(parsed.pathname.startsWith("/s/") || parsed.pathname.startsWith("/song/"))
+    ) {
+      return res.status(400).json({
+        success: false,
+        error: "Only Suno share/song links are supported",
+      });
+    }
+
+    const cacheKey = parsed.href;
+    const cached = sunoResolveCache.get(cacheKey);
+    if (cached && Date.now() - cached.timestamp < CACHE_DURATION) {
+      return res.json({ success: true, ...cached.data, cached: true });
+    }
+
+    try {
+      const response = await fetch(parsed.href, {
+        redirect: "follow",
+        headers: {
+          "User-Agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+          Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        },
+        signal: AbortSignal.timeout(15000),
+      });
+
+      if (!response.ok) {
+        throw new Error(`Suno page returned ${response.status}`);
+      }
+
+      const finalUrl = response.url;
+      if (!["suno.com", "www.suno.com"].includes(new URL(finalUrl).hostname.toLowerCase())) {
+        throw new Error("Suno redirected outside suno.com");
+      }
+
+      const html = await response.text();
+      const decoded = html.replace(/\\"/g, '"').replace(/\\\//g, "/");
+      const canonicalMatch = decoded.match(
+        /<link rel="canonical" href="(https:\/\/suno\.com\/song\/[^"]+)"/i,
+      );
+      const videoMatch = decoded.match(
+        /"video_url":"(https:\/\/[^"]+?\.mp4)"/i,
+      );
+      const mediaMatches = [
+        ...decoded.matchAll(/"url":"(https:\/\/[^"]+?\.(?:m4a|mp3|mp4))"/gi),
+      ].map((match) => match[1]);
+
+      const videoUrl = videoMatch?.[1] || null;
+      const audioUrl = mediaMatches.find((url) => /\.m4a(\?|$)/i.test(url)) || null;
+      const mediaUrls = [...new Set([audioUrl, videoUrl, ...mediaMatches].filter(Boolean))];
+
+      if (!audioUrl && !videoUrl) {
+        throw new Error("Could not find an audio/video URL on the Suno page");
+      }
+
+      const songId =
+        canonicalMatch?.[1]?.match(/song\/([a-f0-9-]{36})/i)?.[1] ||
+        videoUrl?.match(/([a-f0-9-]{36})/i)?.[1] ||
+        null;
+      const titleMatch = decoded.match(/<title>([^<]*)<\/title>/i);
+
+      const data = {
+        songId,
+        canonicalUrl: canonicalMatch?.[1] || finalUrl,
+        title: titleMatch?.[1]?.replace(/&amp;/g, "&").trim() || null,
+        audioUrl: audioUrl || videoUrl,
+        videoUrl,
+        mediaUrls,
+      };
+
+      cacheSet(sunoResolveCache, cacheKey, { data, timestamp: Date.now() });
+      res.set("Cache-Control", "public, max-age=300");
+      return res.json({ success: true, ...data, cached: false });
+    } catch (err) {
+      console.error("Suno resolve error:", err);
+      return res.status(502).json({
+        success: false,
+        error: "Could not resolve the Suno song page",
+      });
+    }
+  },
+);
+
 app.get("/api/suno-page-proxy", async (req, res) => {
   const url = req.query.url;
   if (!url) return res.status(400).send("Missing url");
