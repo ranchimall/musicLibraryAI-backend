@@ -195,16 +195,41 @@ function buildFormulaDescription(config = DEFAULT_MARKETPLACE_CONFIG) {
 
   return {
     mode: "weighted",
-    consumption:
-      "Consumption = (Total Plays + Total Likes) + (People * people_weight) + (Tasks * task_weight) + Admin Score",
+    consumption: `Consumption = (Total Plays + Total Likes) + (People * ${cfg.people_weight}) + (Tasks * ${cfg.task_weight}) + Admin Score`,
+    playsDefinition:
+      "Total Plays = native platform plays only. Suno/Flow source play counts are tracked separately.",
+    likesDefinition:
+      "Total Likes = distinct user likes on the attached tracks.",
+    peopleDefinition:
+      "People = distinct active members on the property (multiple roles count once).",
+    tasksDefinition:
+      "Tasks = all tasks linked to the property, regardless of task status.",
+    adminScoreDefinition:
+      "Admin Score = additive admin bonus (positive), penalty (negative), or 0.",
     basePrice: `Base Price = Consumption * ${cfg.base_unit_value} USDAI`,
     currentPrice:
       "Current Price = Base Price * (1 + Scarcity * 0.15) * (1 + Utility * 0.15)",
+    scarcity:
+      "Scarcity = clamp(unique want-to-buy / max(unique want-to-sell, 1), 0.1, 10) over the last 7 days.",
+    utility:
+      "Utility = sum(usage event count × event weight) + log10(1 + platform plays) × 0.5.",
+    usageWeights: {
+      licensed_media: 3,
+      public_infrastructure: 4,
+      product_integration: 4,
+      rights_lease_as_payment: 3,
+      embed: 1,
+      external_play: 0.5,
+    },
     totalConsumption: `Total_Consumption = Sum of Consumption of each property in Top ${topN}`,
+    topNConfig: `Top N is configurable; current value = ${topN}.`,
     consumptionShare:
       "Consumption_Share = Property_Consumption / Total_Consumption",
+    bundle:
+      "Weakest bundle = sum of its member properties' consumption; its share is the sum of their shares.",
     poolPricePerUnit:
       "Price per unit = Total USDAI in the pool / Total number of units",
+    poolPriceStatus: "deferred",
     weakBundle: {
       enabled: cfg.weak_bundle_enabled,
       size: cfg.weak_bundle_size,
