@@ -3,6 +3,8 @@ require("./lib");
 const floCrypto = require("./floCrypto");
 
 const MAX_SKEW_MS = parseInt(process.env.MAX_AUTH_SKEW_MS) || 5 * 60 * 1000; // 5 minute replay window
+const MAX_AUTH_REQUESTS_PER_MINUTE =
+  parseInt(process.env.MAX_AUTH_REQUESTS_PER_MINUTE) || 60;
 
 // Shared rate limiting state (exported for server.js to access)
 const authAttempts = new Map();
@@ -48,12 +50,12 @@ function rateLimitAuth(req, res, next) {
   const attempts = authAttempts.get(key) || [];
   const recent = attempts.filter((t) => now - t < 60000); // 1 minute window
 
-  if (recent.length >= 5) {
-    // Ban for 1 hour after 5 failures in 1 minute
+  if (recent.length >= MAX_AUTH_REQUESTS_PER_MINUTE) {
+    // Ban for 1 hour after sustained excessive auth traffic.
     bannedIPs.set(req.ip, now + 3600000);
     authAttempts.delete(key);
     console.warn(
-      `IP ${req.ip} banned for 1 hour due to ${recent.length} auth failures in 1 minute`,
+      `IP ${req.ip} banned for 1 hour due to ${recent.length} auth requests in 1 minute`,
     );
     return res.status(429).json({
       success: false,
